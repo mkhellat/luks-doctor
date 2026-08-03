@@ -9,6 +9,7 @@ knowledge of LUKS internals.
 
 - [What LUKS2 is, and why header/keyslot separation exists](#what-luks2-is-and-why-headerkeyslot-separation-exists)
 - [On-disk layout](#on-disk-layout)
+  - [The binary header, byte-by-byte](#the-binary-header-byte-by-byte)
 - [The JSON metadata area](#the-json-metadata-area)
 - [Reading Area offset / Area length](#reading-area-offset--area-length)
 - [Argon2id](#argon2id)
@@ -55,55 +56,147 @@ it is unrecoverable, no matter how correct your passphrase is.
 
 ## On-disk layout
 
-A LUKS2 device, from byte 0, looks roughly like this:
+A LUKS2 device, from byte 0, is divided into three logical areas (per the
+[LUKS2 on-disk format spec](https://gitlab.com/cryptsetup/LUKS2-docs)): the
+binary structured header, the JSON metadata area, and the keyslots area.
+The binary header and JSON area are each stored **twice** (primary +
+secondary); the keyslots area has no redundancy at all.
+
+Concretely, for a volume created with defaults (`cryptsetup luksFormat`'s
+12 KiB JSON area, one keyslot) the byte ranges look like this:
 
 ```
-offset 0x0000  ┌────────────────────────────────────┐
-               │ Primary binary header (4 KiB)       │  fixed-size, "LUKS" magic
-               ├────────────────────────────────────┤
-               │ Primary JSON metadata area           │  size given in binary header
-               │ (typically ~12 KiB of the total      │
-               │  16 KiB primary metadata region)     │
-0x4000         ├────────────────────────────────────┤
-               │ Secondary (backup) binary header     │  fixed-size, "SKUL" magic
-               │ (4 KiB)                               │  (byte-reversed magic — see below)
-               ├────────────────────────────────────┤
-               │ Secondary JSON metadata area          │  mirror of primary JSON
-               │ (same size as primary)                │
-   ...         ├────────────────────────────────────┤
-               │ Keyslot areas                         │  one binary region per keyslot,
-               │ (binary, AF-striped, high-entropy)    │  offset/size defined in JSON
-   ...         ├────────────────────────────────────┤
-               │ (optional) LUKS2 token/other areas    │
-   ...         ├────────────────────────────────────┤
-               │ Data segment                          │  the actual encrypted payload
-               │ (everything the mapped /dev/mapper/*  │  (filesystem, LVM PV, etc.)
-               │  device exposes)                      │
-               └────────────────────────────────────┘
+Offset (hex)  Offset (dec)  Size        Region
+------------  ------------  ----------  ------------------------------------
+0x00000000    0             4096 B      Primary binary header
+                                         ("LUKS\xba\xbe" magic, see below)
+0x00001000    4096          12288 B     Primary JSON metadata area
+                                         (hdr_size - 4096 bytes)
+------------  ------------  ----------  ------------------------------------
+0x00004000    16384         4096 B      Secondary binary header
+                                         ("SKUL\xba\xbe" magic, reversed)
+0x00005000    20480         12288 B     Secondary JSON metadata area
+                                         (mirrors primary JSON content)
+------------  ------------  ----------  ------------------------------------
+0x00008000    32768         variable    Keyslot area(s)  [example offset]
+                                         one region per keyslot; exact
+                                         offset/size come from each keyslot's
+                                         JSON "area" object, not a fixed
+                                         layout (see below)
+------------  ------------  ----------  ------------------------------------
+...           ...           variable    (optional) LUKS2 token data,
+                                         if any token stores inline data
+------------  ------------  ----------  ------------------------------------
+0x00400000    4194304       variable    Data segment  [example offset]
+              (4 MiB)                   the encrypted payload itself
+                                         (filesystem, LVM PV, ...); starts
+                                         where JSON "segments" says it does
+------------  ------------  ----------  ------------------------------------
 ```
 
-Key points:
+The `0x00400000` (4 MiB) start for the data segment above is
+`cryptsetup luksFormat`'s **default total metadata region size** — not a
+fixed constant. The actual boundary is whatever the JSON `segments.0.offset`
+field says (see [The JSON metadata
+area](#the-json-metadata-area)); it can be as small as the primary+secondary
+header/JSON regions require, or explicitly widened at format time
+(`--luks2-metadata-size`, `--luks2-keyslots-size`) to leave room for more or
+larger keyslots.
 
-- The **default total metadata size** reserved at the front of a LUKS2
-  device is 16 MiB (primary header + JSON, secondary header + JSON, and
-  keyslot areas all live inside this region by default), though this is
-  configurable at format time (`cryptsetup luksFormat --luks2-metadata-size`
-  / `--luks2-keyslots-size`).
-- The **primary header** starts at offset 0. The **secondary (backup)
-  header** starts at a fixed offset of `0x4000` (16384 bytes) into the
-  device by default.
-- Each binary header is followed immediately by its own JSON metadata
-  area. The primary and secondary JSON areas are supposed to be mirror
-  images of each other — same content, describing the same volume.
-- **Keyslot areas** are binary regions elsewhere in the metadata region
-  (not fixed offsets — their exact location is *described by* the JSON
-  metadata, not implied by a fixed layout). This is a key difference
-  from LUKS1, where keyslot geometry was rigidly fixed by the format.
-  LUKS2's JSON-described layout is what allows variable numbers of
-  keyslots, variable KDF parameters per keyslot, and other flexibility.
-- The **data segment** — the actual encrypted filesystem or payload —
-  begins after the metadata region and continues to the end of the
-  device (or to wherever the JSON `segments` object says it does).
+Likewise, the secondary header's `0x4000` offset above is only the default
+that follows from a 12 KiB JSON area — it is fixed *relative to the
+configured JSON area size*, since the secondary header must start
+immediately after the primary header's JSON area ends. The LUKS2 spec
+defines a fixed table of valid (offset, JSON-size) pairs — a device is never
+free to pick an arbitrary secondary offset:
+
+| Secondary header offset (bytes) | JSON area size |
+|---|---|
+| `0x004000` (16384)   | 12 KiB |
+| `0x008000` (32768)   | 28 KiB |
+| `0x010000` (65536)   | 60 KiB |
+| `0x020000` (131072)  | 124 KiB |
+| `0x040000` (262144)  | 252 KiB |
+| `0x080000` (524288)  | 508 KiB |
+| `0x100000` (1048576) | 1020 KiB |
+| `0x200000` (2097152) | 2044 KiB |
+| `0x400000` (4194304) | 4092 KiB |
+
+Always read the *actual* secondary offset from the primary header's
+`hdr_size` field (or `luksDump`'s output) rather than assuming `0x4000` —
+see the binary header field table below for where `hdr_size` lives.
+
+### The binary header, byte-by-byte
+
+The 4 KiB binary header (`struct luks2_hdr_disk` in `cryptsetup`'s source,
+per the [official LUKS2 on-disk format
+spec](https://gitlab.com/cryptsetup/LUKS2-docs)) is a fixed, packed C
+struct — every field lives at a precise byte offset, all multi-byte
+integers are big-endian, and all strings are NUL-terminated. This is the
+part of the header `blkid` and similar tools scan without touching the
+JSON area at all:
+
+```
+Offset (hex/dec)   Field         Size (B)  Purpose
+-----------------  ------------  --------  ----------------------------------
+0x0000    (0)      magic                6  "LUKS\xba\xbe" (primary) or
+                                            "SKUL\xba\xbe" (secondary,
+                                            byte-reversed)
+0x0006    (6)      version              2  Always 2 for LUKS2
+0x0008    (8)      hdr_size             8  Total header size incl. JSON area
+                                            (bytes) — secondary offset/size
+                                            must match this
+0x0010    (16)     seqid                8  Sequence number, bumped on every
+                                            update; higher seqid wins on a
+                                            primary/secondary disagreement
+0x0018    (24)     label               48  Optional ASCII label, or empty
+0x0048    (72)     csum_alg            32  Checksum algorithm name, e.g.
+                                            "sha256"
+0x0068    (104)    salt                64  Per-header random salt (anti-
+                                            dedup; unused after header read)
+0x00a8    (168)    uuid                40  Device UUID (LUKS1-compatible
+                                            format)
+0x00d0    (208)    subsystem           48  Optional secondary label
+0x0100    (256)    hdr_offset           8  This header's own offset on the
+                                            device (bytes) — must match
+                                            reality, or the header is
+                                            rejected
+0x0108    (264)    padding            184  Reserved, must be zeroed
+0x01c0    (448)    csum                64  Checksum over the whole binary
+                                            header + JSON area (csum field
+                                            itself zeroed during computation)
+0x0200    (512)    padding4096       3584  Reserved, must be zeroed (pads
+                                            the struct out to one full
+                                            4096-byte sector for atomic
+                                            writes)
+-----------------  ------------  --------  ----------------------------------
+                   TOTAL             4096
+```
+
+Two fields carry the most operational weight for diagnosis:
+
+- **`hdr_size`** — tells you exactly where the JSON area ends and,
+  therefore, where the secondary header must begin. If a tool's assumed
+  `0x4000` offset doesn't match, check this field first before suspecting
+  corruption.
+- **`hdr_offset`** — a self-check: the header records *its own* expected
+  position. A mismatch here (e.g. because a partition was resized or the
+  device start shifted) means the header must not be trusted, even if its
+  checksum is otherwise internally consistent — this is a deliberate
+  guard against partition-table manipulation, not a corruption case
+  `cryptsetup repair` can silently paper over.
+
+Per the spec, only the first 512 bytes of this 4096-byte struct are
+actually populated — the trailing `padding4096` exists purely so the
+whole header fits in one atomically-writable sector.
+
+One more structural point not visible in either diagram above: **keyslot
+areas have no fixed offsets at all** — unlike LUKS1, where keyslot geometry
+was rigidly baked into the format, LUKS2 keyslot location and size are
+*described by* each keyslot's own `area` object in the JSON metadata (see
+[Reading Area offset / Area length](#reading-area-offset--area-length)).
+This indirection is what allows a variable number of keyslots with
+independent KDF parameters, rather than a fixed number of fixed-size slots.
 
 ## The JSON metadata area
 
