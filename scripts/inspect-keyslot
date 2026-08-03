@@ -1,0 +1,166 @@
+#!/bin/sh
+#
+# inspect-keyslot - extract and hex-dump a LUKS2 keyslot's raw key
+# material area directly from a device, with a rough visual corruption
+# heuristic. See docs/checking-for-corruption.md for the methodology
+# and how to interpret the output.
+
+set -eu
+
+PROG="$(basename "$0")"
+ZERO_RUN_THRESHOLD=32   # bytes; see usage note below on why this is a rough heuristic
+HEAD_TAIL_BYTES=128
+
+usage() {
+    cat <<EOF
+Usage: $PROG [--slot N] [--zero-threshold N] /dev/sdX
+
+Inspect a LUKS2 keyslot's raw on-disk key material.
+
+Dumps the head and tail of the keyslot's AF-striped area (via dd+xxd)
+and runs a rough heuristic check for long zero-byte runs, which can
+indicate a truncated or corrupted write. This is NOT a rigorous entropy
+test - it is a quick visual aid. See docs/checking-for-corruption.md
+for what healthy vs. corrupted output actually looks like and how to
+interpret it.
+
+Options:
+  --slot N              Inspect keyslot N directly, skipping the prompt.
+  --zero-threshold N    Flag zero-byte runs of at least N bytes as
+                         suspicious (default: $ZERO_RUN_THRESHOLD).
+  -h, --help             Show this help and exit.
+
+Requires root (or equivalent raw device read access).
+
+Example:
+  sudo $PROG /dev/sdX
+  sudo $PROG --slot 0 /dev/sdX
+EOF
+}
+
+die() {
+    echo "$PROG: error: $*" >&2
+    exit 1
+}
+
+DEVICE=""
+SLOT=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --slot)
+            [ $# -ge 2 ] || die "--slot requires an argument"
+            SLOT="$2"
+            shift 2
+            ;;
+        --zero-threshold)
+            [ $# -ge 2 ] || die "--zero-threshold requires an argument"
+            ZERO_RUN_THRESHOLD="$2"
+            shift 2
+            ;;
+        -*)
+            die "unknown option: $1 (see --help)"
+            ;;
+        *)
+            [ -z "$DEVICE" ] || die "unexpected extra argument: $1"
+            DEVICE="$1"
+            shift
+            ;;
+    esac
+done
+
+[ -n "$DEVICE" ] || { usage >&2; exit 1; }
+[ -b "$DEVICE" ] || [ -f "$DEVICE" ] || die "$DEVICE is not a block device or file"
+
+command -v cryptsetup >/dev/null 2>&1 || die "cryptsetup not found in PATH"
+command -v xxd >/dev/null 2>&1 || die "xxd not found in PATH"
+
+# luksDump on a raw device needs read access to the header region even
+# before we get to the keyslot area itself, so fail fast with a clear
+# message rather than letting cryptsetup's permission error stand alone.
+if [ "$(id -u)" -ne 0 ]; then
+    die "must be run as root (raw device read access is required)"
+fi
+
+DUMP="$(cryptsetup luksDump "$DEVICE" 2>&1)" || die "cryptsetup luksDump failed:
+$DUMP"
+
+# Keyslot numbers appear as "  N: luks2" lines in luksDump output.
+# POSIX-safe alternative to bash's `mapfile`: build a newline-separated
+# list via a subshell/command substitution, then iterate with a
+# temporary IFS-based read loop instead of an array.
+AVAILABLE_SLOTS="$(printf '%s\n' "$DUMP" | grep -E '^[[:space:]]+[0-9]+: luks2' | \
+    sed -E 's/^[[:space:]]+([0-9]+): luks2.*/\1/')"
+
+[ -n "$AVAILABLE_SLOTS" ] || die "no luks2 keyslots found on $DEVICE"
+
+AVAILABLE_SLOTS_LINE="$(printf '%s' "$AVAILABLE_SLOTS" | tr '\n' ' ')"
+
+if [ -z "$SLOT" ]; then
+    slot_count="$(printf '%s\n' "$AVAILABLE_SLOTS" | wc -l)"
+    if [ "$slot_count" -eq 1 ]; then
+        SLOT="$AVAILABLE_SLOTS"
+    else
+        echo "Multiple keyslots found: $AVAILABLE_SLOTS_LINE"
+        printf 'Which keyslot to inspect? '
+        read -r SLOT
+    fi
+fi
+
+printf '%s\n' "$AVAILABLE_SLOTS" | grep -qx "$SLOT" || \
+    die "keyslot $SLOT not found (available: $AVAILABLE_SLOTS_LINE)"
+
+# Extract this slot's block from luksDump: from its "N: luks2" line up
+# to (but not including) the next top-level keyslot line or section.
+SLOT_BLOCK="$(printf '%s\n' "$DUMP" | awk -v slot="$SLOT" '
+    /^  [0-9]+: luks2/ {
+        n = $1; sub(":", "", n)
+        if (in_block) exit
+        if (n == slot) { in_block = 1 }
+    }
+    in_block { print }
+')"
+
+AREA_OFFSET="$(printf '%s\n' "$SLOT_BLOCK" | \
+    sed -n 's/.*Area offset:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)"
+AREA_LENGTH="$(printf '%s\n' "$SLOT_BLOCK" | \
+    sed -n 's/.*Area length:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)"
+
+[ -n "$AREA_OFFSET" ] && [ -n "$AREA_LENGTH" ] || \
+    die "could not parse Area offset/length for keyslot $SLOT from luksDump output"
+
+echo "Keyslot $SLOT: Area offset=$AREA_OFFSET bytes, Area length=$AREA_LENGTH bytes"
+echo
+
+RAW_HEX="$(dd if="$DEVICE" bs=1 skip="$AREA_OFFSET" count="$AREA_LENGTH" 2>/dev/null | xxd)"
+
+echo "--- head (first $HEAD_TAIL_BYTES bytes) ---"
+printf '%s\n' "$RAW_HEX" | head -n "$((HEAD_TAIL_BYTES / 16))"
+echo
+echo "--- tail (last $HEAD_TAIL_BYTES bytes) ---"
+printf '%s\n' "$RAW_HEX" | tail -n "$((HEAD_TAIL_BYTES / 16))"
+echo
+
+# Rough heuristic only: count the longest run of the zero byte in the
+# raw area. Real high-entropy ciphertext can produce short coincidental
+# runs by chance; this is a visual aid to catch gross truncation/wipe
+# damage, not a statistical corruption proof. See docs/checking-for-corruption.md.
+LONGEST_ZERO_RUN="$(dd if="$DEVICE" bs=1 skip="$AREA_OFFSET" count="$AREA_LENGTH" 2>/dev/null | \
+    od -An -tu1 -v | tr -s ' ' '\n' | awk '
+        $0 == "0" { run++; if (run > max) max = run; next }
+        { run = 0 }
+        END { print max + 0 }
+    ')"
+
+echo "Longest zero-byte run in keyslot area: $LONGEST_ZERO_RUN bytes"
+if [ "$LONGEST_ZERO_RUN" -ge "$ZERO_RUN_THRESHOLD" ]; then
+    echo "NOTE: this exceeds the zero-run threshold ($ZERO_RUN_THRESHOLD bytes)."
+    echo "      This is a rough visual flag, not a diagnosis - see"
+    echo "      docs/checking-for-corruption.md for how to interpret it."
+else
+    echo "No suspiciously long zero-runs found (threshold: $ZERO_RUN_THRESHOLD bytes)."
+fi
