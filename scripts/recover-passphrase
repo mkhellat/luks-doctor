@@ -1,0 +1,324 @@
+#!/bin/sh
+#
+# recover-passphrase - bounded edit-distance-1 search for a nearly-
+# correct LUKS2 passphrase (one substitution, deletion, or insertion
+# away from a known-good guess). Uses `cryptsetup open --test-passphrase`,
+# which verifies without activating/mapping the device. See
+# docs/passphrase-recovery.md for the methodology and why this is
+# deliberately NOT a general password-cracking tool.
+
+set -eu
+
+PROG="$(basename "$0")"
+
+DO_SUBSTITUTION=1
+DO_DELETION=1
+DO_INSERTION=1
+INSERT_CHARS='0123456789!@#$%^&*_-.'
+
+usage() {
+    cat <<EOF
+Usage: $PROG [OPTIONS] /dev/sdX 'best-guess-passphrase'
+
+Search for a working LUKS2 passphrase within edit distance 1 of a
+known-good guess, using safe non-activating verification
+(cryptsetup open --test-passphrase). Intended for the case where you
+are highly confident of a passphrase but suspect exactly one typo'd,
+dropped, or extra character. Not a general brute-force tool - see
+docs/passphrase-recovery.md.
+
+Options:
+  --no-substitution     Skip QWERTY-adjacency / shift-symbol substitution candidates.
+  --no-deletion         Skip single-character deletion candidates.
+  --no-insertion        Skip single-character insertion candidates.
+  --insert-chars STR    Character set to try inserting (default: $INSERT_CHARS).
+  -h, --help            Show this help and exit.
+
+Requires root (cryptsetup needs raw device access to test a passphrase).
+
+Example:
+  sudo $PROG /dev/sdX 'my-best-guess-passphrase'
+EOF
+}
+
+die() {
+    echo "$PROG: error: $*" >&2
+    exit 1
+}
+
+DEVICE=""
+GUESS=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --no-substitution)
+            DO_SUBSTITUTION=0
+            shift
+            ;;
+        --no-deletion)
+            DO_DELETION=0
+            shift
+            ;;
+        --no-insertion)
+            DO_INSERTION=0
+            shift
+            ;;
+        --insert-chars)
+            [ $# -ge 2 ] || die "--insert-chars requires an argument"
+            INSERT_CHARS="$2"
+            shift 2
+            ;;
+        -*)
+            die "unknown option: $1 (see --help)"
+            ;;
+        *)
+            if [ -z "$DEVICE" ]; then
+                DEVICE="$1"
+            elif [ -z "$GUESS" ]; then
+                GUESS="$1"
+            else
+                die "unexpected extra argument: $1"
+            fi
+            shift
+            ;;
+    esac
+done
+
+[ -n "$DEVICE" ] && [ -n "$GUESS" ] || { usage >&2; exit 1; }
+[ -b "$DEVICE" ] || [ -f "$DEVICE" ] || die "$DEVICE is not a block device or file"
+command -v cryptsetup >/dev/null 2>&1 || die "cryptsetup not found in PATH"
+
+if [ "$(id -u)" -ne 0 ]; then
+    die "must be run as root (cryptsetup needs raw device access)"
+fi
+
+# Adjacency reflects physical QWERTY neighbors plus shift/symbol pairs
+# sharing a key - these are the substitution slips a typing finger or a
+# half-remembered passphrase actually produces, not a random character map.
+#
+# POSIX-safe replacement for bash's `declare -A ADJACENT=(...)`: a
+# case statement mapping each character to its adjacency string.
+adjacent_chars() {
+    case "$1" in
+        a) echo "qwsz" ;;
+        b) echo "vghn" ;;
+        c) echo "xdfv" ;;
+        d) echo "serfcx" ;;
+        e) echo "wsdr34" ;;
+        f) echo "drtgvc" ;;
+        g) echo "ftyhbv" ;;
+        h) echo "gyujnb" ;;
+        i) echo "ujko89" ;;
+        j) echo "huikmn" ;;
+        k) echo "jiolm" ;;
+        l) echo "kop" ;;
+        m) echo "njk" ;;
+        n) echo "bhjm" ;;
+        o) echo "iklp90" ;;
+        p) echo "ol0" ;;
+        q) echo "wa12" ;;
+        r) echo "edft45" ;;
+        s) echo "awedxz" ;;
+        t) echo "rfgy56" ;;
+        u) echo "yhji78" ;;
+        v) echo "cfgb" ;;
+        w) echo "qsae23" ;;
+        x) echo "zsdc" ;;
+        y) echo "tghu67" ;;
+        z) echo "asx" ;;
+        1) echo "q2" ;;
+        2) echo "q1w3" ;;
+        3) echo "w2e4" ;;
+        4) echo "e3r5" ;;
+        5) echo "r4t6" ;;
+        6) echo "t5y7" ;;
+        7) echo "y6u8" ;;
+        8) echo "u7i9" ;;
+        9) echo "i8o0" ;;
+        0) echo "o9p" ;;
+        *) echo "" ;;
+    esac
+}
+
+# POSIX-safe replacement for bash's `declare -A SHIFT_PAIR=(...)` plus
+# the reverse-mapping loop that filled in both directions: a single
+# case statement listing both directions explicitly.
+shift_pair() {
+    case "$1" in
+        1) echo "!" ;;
+        2) echo "@" ;;
+        3) echo "#" ;;
+        4) echo '$' ;;
+        5) echo "%" ;;
+        6) echo "^" ;;
+        7) echo "&" ;;
+        8) echo "*" ;;
+        9) echo "(" ;;
+        0) echo ")" ;;
+        -) echo "_" ;;
+        =) echo "+" ;;
+        "'") echo '"' ;;
+        ,) echo "<" ;;
+        .) echo ">" ;;
+        /) echo "?" ;;
+        ";") echo ":" ;;
+        "!") echo "1" ;;
+        "@") echo "2" ;;
+        "#") echo "3" ;;
+        '$') echo "4" ;;
+        "%") echo "5" ;;
+        "^") echo "6" ;;
+        "&") echo "7" ;;
+        "*") echo "8" ;;
+        "(") echo "9" ;;
+        ")") echo "0" ;;
+        _) echo "-" ;;
+        +) echo "=" ;;
+        '"') echo "'" ;;
+        "<") echo "," ;;
+        ">") echo "." ;;
+        "?") echo "/" ;;
+        ":") echo ";" ;;
+        *) echo "" ;;
+    esac
+}
+
+# POSIX-safe substring helpers, replacing bash's ${var:offset:length}.
+# Positions are 0-based on input/output to match the original bash
+# indexing; internally these convert to `cut -c`'s 1-based, inclusive
+# ranges.
+
+# char_at STR POS -> single character at 0-based POS (empty if out of range)
+char_at() {
+    _s="$1"
+    _pos="$2"
+    printf '%s' "$_s" | cut -c "$((_pos + 1))"
+}
+
+# substr_from STR POS -> substring from 0-based POS to end
+substr_from() {
+    _s="$1"
+    _pos="$2"
+    if [ "$_pos" -lt "${#_s}" ]; then
+        printf '%s' "$_s" | cut -c "$((_pos + 1))-"
+    else
+        printf ''
+    fi
+}
+
+# substr_range STR START END -> substring covering 0-based [START, END)
+# (i.e. bash's ${STR:START:END-START}); empty if the range is empty.
+substr_range() {
+    _s="$1"
+    _start="$2"
+    _end="$3"
+    if [ "$_end" -le "$_start" ]; then
+        printf ''
+    else
+        printf '%s' "$_s" | cut -c "$((_start + 1))-${_end}"
+    fi
+}
+
+len=${#GUESS}
+
+# POSIX sh has no arrays, so candidates and their labels are accumulated
+# as newline-delimited records ("candidate<TAB>label") in a temp file
+# instead of bash's CANDIDATES=()/LABELS=() arrays. This is cleaned up
+# on exit via a trap.
+CAND_FILE="$(mktemp)"
+trap 'rm -f "$CAND_FILE"' EXIT INT TERM
+
+add_candidate() {
+    printf '%s\t%s\n' "$1" "$2" >>"$CAND_FILE"
+}
+
+if [ "$DO_SUBSTITUTION" -eq 1 ]; then
+    i=0
+    while [ "$i" -lt "$len" ]; do
+        ch="$(char_at "$GUESS" "$i")"
+        repl="$(adjacent_chars "$ch")$(shift_pair "$ch")"
+        replen=${#repl}
+        j=0
+        while [ "$j" -lt "$replen" ]; do
+            rc="$(char_at "$repl" "$j")"
+            candidate="$(substr_range "$GUESS" 0 "$i")${rc}$(substr_from "$GUESS" $((i + 1)))"
+            add_candidate "$candidate" "substitution, pos $i"
+            j=$((j + 1))
+        done
+        i=$((i + 1))
+    done
+fi
+
+if [ "$DO_DELETION" -eq 1 ]; then
+    i=0
+    while [ "$i" -lt "$len" ]; do
+        candidate="$(substr_range "$GUESS" 0 "$i")$(substr_from "$GUESS" $((i + 1)))"
+        add_candidate "$candidate" "deletion, pos $i"
+        i=$((i + 1))
+    done
+fi
+
+if [ "$DO_INSERTION" -eq 1 ]; then
+    insert_len=${#INSERT_CHARS}
+    i=0
+    while [ "$i" -le "$len" ]; do
+        j=0
+        while [ "$j" -lt "$insert_len" ]; do
+            ic="$(char_at "$INSERT_CHARS" "$j")"
+            candidate="$(substr_range "$GUESS" 0 "$i")${ic}$(substr_from "$GUESS" "$i")"
+            add_candidate "$candidate" "insertion, pos $i"
+            j=$((j + 1))
+        done
+        i=$((i + 1))
+    done
+fi
+
+total="$( [ -s "$CAND_FILE" ] && wc -l <"$CAND_FILE" || echo 0 )"
+[ "$total" -gt 0 ] || die "no candidates generated (all edit operations disabled?)"
+
+echo "luks-doctor: testing keyslot(s) on $DEVICE"
+echo "luks-doctor: base guess: $GUESS"
+echo "luks-doctor: generated $total candidates (substitution + deletion + insertion)"
+
+found=0
+n=0
+while IFS="$(printf '\t')" read -r candidate label; do
+    n=$((n + 1))
+    printf 'luks-doctor: [%d/%d] testing candidate (%s)... ' "$n" "$total" "$label"
+    if printf '%s' "$candidate" | cryptsetup open --test-passphrase "$DEVICE" 2>/dev/null; then
+        echo "MATCH"
+        echo
+        echo "luks-doctor: recovered passphrase:"
+        echo "  $GUESS   (original guess, for reference)"
+        echo "  $candidate    (working passphrase - $label)"
+        echo
+        echo "luks-doctor: SECURITY REMINDER"
+        echo "  This passphrase is now confirmed and was found via automated search."
+        echo "  You should:"
+        echo "    1. Unlock the volume normally and mount it to confirm data access."
+        echo "    2. Add a new keyslot with a passphrase you're confident you can type"
+        echo "       reliably: cryptsetup luksAddKey $DEVICE"
+        echo "    3. Once confirmed working, consider removing the old/typo-prone"
+        echo "       keyslot: cryptsetup luksKillSlot $DEVICE <slot>"
+        echo "  Treat any passphrase that was ever tested in bulk, or written to a"
+        echo "  terminal/log, as lower-confidence going forward - rotate it if this"
+        echo "  volume protects anything sensitive."
+        found=1
+        break
+    else
+        echo "no match"
+    fi
+done <"$CAND_FILE"
+
+if [ "$found" -eq 0 ]; then
+    echo
+    echo "luks-doctor: no match found among $total edit-distance-1 candidates."
+    echo "luks-doctor: the passphrase may differ by more than one edit, or the"
+    echo "luks-doctor: base guess may be further off than assumed. See the Roadmap"
+    echo "luks-doctor: in README.md for approaches not yet implemented here."
+    exit 1
+fi
