@@ -1,0 +1,11 @@
+# Editors
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Local test artifacts
+*.img
+*.raw
+test-volume*
+scratch/
