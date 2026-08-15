@@ -59,6 +59,24 @@ Find the keyslot you care about and note its `Area offset` and
 [`luks2-header-anatomy.md#reading-area-offset--area-length`](luks2-header-anatomy.md#reading-area-offset--area-length)
 for what these mean.
 
+**Checking more than one keyslot**: a volume can have several independent
+keyslots, and their numbers are not guaranteed to be contiguous starting at
+`0` — a keyslot can be removed (`luksKillSlot`) without renumbering the
+ones that remain, so a two-keyslot volume might show slots `0` and `2`,
+not `0` and `1`. List every keyslot number actually present before deciding
+which ones to inspect:
+
+```
+sudo cryptsetup luksDump /dev/sdX | grep -E '^  [0-9]+: '
+```
+
+Each listed slot has its own independent `Area offset`/`Area length` —
+repeat the extraction below for each one you need to check. This matters
+because damage is typically local to whichever slot was being written when
+something went wrong; an intact slot elsewhere on the same device is a
+legitimate way back in if the one you were using is damaged (see the
+decision guide below).
+
 Then extract exactly that byte range:
 
 ```
