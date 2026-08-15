@@ -255,8 +255,18 @@ Work through these in order:
 1. **Does `cryptsetup luksDump /dev/sdX` succeed cleanly?**
    - No, checksum/JSON error → try `sudo cryptsetup repair /dev/sdX`,
      then re-run `luksDump`. If it now succeeds, proceed to step 2. If
-     it still fails, structural damage may be unrecoverable without a
-     `luksHeaderBackup` taken before the damage occurred.
+     it still fails and you have a `luksHeaderBackup` file taken before
+     the damage occurred, restore it:
+     ```
+     sudo cryptsetup luksHeaderRestore /dev/sdX --header-backup-file ./header-backup.img
+     ```
+     This overwrites the device's current header region with the
+     backup's — only run it against a backup you're confident predates
+     the damage, since it discards whatever header state is currently
+     on disk (including any keyslots added or changed since that
+     backup was taken). Re-run `luksDump` afterward to confirm. Without
+     a pre-damage backup, structural damage that `repair` can't fix is
+     very likely unrecoverable.
    - Yes → proceed to step 2.
 
 2. **Does the target keyslot's `area` show visible corruption when
