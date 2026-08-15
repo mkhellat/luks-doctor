@@ -213,12 +213,48 @@ default), a single bit flip anywhere in the stripe data still produces
 output that's statistically indistinguishable from correct, healthy
 noise — see
 [`af-splitting-explained.md`](af-splitting-explained.md#why-this-makes-corruption-unrecoverable-three-demonstrations)
-for a worked demonstration of exactly why. LUKS2 keyslot areas carry no
-checksum or ECC layer of their own to catch this kind of damage — if
-you suspect subtle bit-level corruption (a failing drive with silent
-read errors, for instance) rather than gross truncation or a fill
-pattern, these heuristics won't tell you either way; your only real
-defense is a `luksHeaderBackup` taken before the damage occurred.
+for a worked demonstration of exactly why.
+
+This isn't a gap this project's tooling happens to have — it's a gap
+**LUKS2 itself has**, and it's worth being precise about exactly where,
+because LUKS2 is not uniformly undefended:
+
+- **The binary header + JSON metadata area**: has a real integrity
+  check. The `csum` field (see
+  [`luks2-header-anatomy.md#the-binary-header-byte-by-byte`](luks2-header-anatomy.md#the-binary-header-byte-by-byte))
+  is a SHA-256 checksum over the whole header+JSON region, and it's
+  exactly what `cryptsetup repair` validates and can resync from the
+  redundant secondary copy if the primary's checksum fails. This region
+  is *not* undefended.
+- **The keyslot key-material `area`**: **no checksum, no parity, no ECC,
+  nothing** — categorically, by design, not as an oversight. There is
+  no field anywhere in the LUKS2 format that could tell you "this
+  keyslot's bytes are damaged" independent of actually trying to derive
+  and unwrap a key from them. Given AF-splitting's anti-forensic goal
+  (a partially-recovered keyslot must reveal nothing), this is
+  arguably the *correct* design choice, not an accidental gap — adding
+  a checksum over the stripe data would itself be a small structural
+  leak about which bytes are "real."
+- **The encrypted data segment** (your actual files): unprotected by
+  default, same as the keyslot area — but, unlike the keyslot area,
+  this one is optional to fix. `cryptsetup luksFormat --integrity
+  hmac-sha256` (or an AEAD cipher mode) layers `dm-integrity`
+  underneath `dm-crypt`, adding a per-sector authentication tag so
+  corrupted or tampered data blocks are detected on read. This has
+  real space and performance overhead and is **not the default** — most
+  LUKS2 volumes, including the one this project's recovery script was
+  originally built for, don't use it. If you're setting up a new
+  volume and data-corruption detection matters to you, `--integrity` is
+  the mechanism to look at; it's out of scope for this project's
+  existing-volume diagnostic tooling.
+
+So: no single answer covers all of LUKS2 — the header is checksummed,
+the keyslot area is permanently and deliberately unchecksummable, and
+the data segment is checksummable but usually isn't checksummed. If you
+suspect subtle bit-level corruption (a failing drive with silent read
+errors, for instance) in a keyslot's key material specifically, these
+heuristics won't tell you either way; your only real defense there is a
+`luksHeaderBackup` taken before the damage occurred.
 
 ## Diffing primary vs. secondary headers
 
