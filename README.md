@@ -151,10 +151,13 @@ following are plausible, not-yet-built extensions — ideas and
 contributions welcome, but none of these are half-implemented anywhere
 in this repo:
 
-- **Keyboard-layout-aware substitution tables.** The current adjacency
-  map assumes US QWERTY. Non-US layouts (AZERTY, QWERTZ, Dvorak, etc.)
-  have different physical neighbor relationships and would need their
-  own maps, selectable via a flag.
+- **Dvorak substitution table.** `recover-passphrase --layout` currently
+  covers `qwerty` (default), `azerty`, and `qwertz` — the three most
+  common physical layouts. Dvorak's fundamentally different key
+  arrangement (optimized for typing efficiency, not physical/historical
+  continuity with QWERTY) would need its own adjacency map built from
+  scratch rather than derived from the QWERTY table, and is left for a
+  future contribution.
 - **Dictionary/mnemonic-based candidate generation.** For passphrases
   built from a memorable phrase or word list, generating candidates
   from likely word substitutions or common transformations (leetspeak,

@@ -75,13 +75,16 @@ Given a base guess, the script generates every candidate reachable by
 exactly one of these edits, applied at every applicable position in the
 string:
 
-1. **Substitution**, using a QWERTY-adjacency map plus a
+1. **Substitution**, using a physical-keyboard-adjacency map plus a
    shift/symbol-confusion table. Covers the case where you meant one
    key but your finger landed on (or you now recall) an adjacent one —
    e.g. `s` for `a` (their neighbors on a QWERTY row), or `@` for `2`
    (the shifted vs. unshifted character sharing a physical key). This
    is the most common real-world typo pattern for passphrases typed on
-   a physical keyboard.
+   a physical keyboard. The adjacency map depends on which physical
+   layout the passphrase was actually typed on — select it with
+   `--layout {qwerty,azerty,qwertz}` (default `qwerty`); see
+   [Keyboard layouts](#keyboard-layouts) below.
 2. **Deletion**, removing exactly one character at each position. Covers
    the case where a keystroke didn't register when the passphrase was
    originally set (a common failure mode with worn keyboards, fast
@@ -142,8 +145,34 @@ Run `./scripts/recover-passphrase --help` for the full option list,
 including limiting which edit operations run and adjusting the
 insertion character set.
 
+## Keyboard layouts
+
+`--layout` selects which physical-key adjacency map substitution
+candidates are generated from:
+
+- **`qwerty`** (default) — US QWERTY. The original, hand-tuned map this
+  tool started with.
+- **`azerty`** — French AZERTY. Row 1 is `a z e r t y u i o p` (not
+  `q w e r t y u i o p`), row 2 gains a trailing `m`, row 3 loses `m` and
+  gains a leading `w`. Digit substitution additionally covers the
+  ASCII-safe subset of AZERTY's unshifted-symbol/shifted-digit number
+  row (`1`↔`&`, `4`↔`'`, `5`↔`(`) — the remaining number-row keys
+  unshift to accented characters (`é`, `"`, `è`, `_`, `ç`, `à`) outside
+  this tool's ASCII-only candidate set and are intentionally skipped.
+- **`qwertz`** — German/Central European QWERTZ. Physically identical
+  to QWERTY except the `Y` and `Z` keys are swapped; every other key,
+  including the whole number row, sits in the same place.
+
+Pick whichever layout the passphrase was actually typed on when the
+suspected typo happened — that's what determines which key a
+mistyped finger would actually have landed on. If you're unsure or the
+passphrase was typed on a layout not listed here (e.g. Dvorak — not yet
+supported, see the [Roadmap](../README.md#roadmap)), the default
+`qwerty` map is still a reasonable first attempt, since deletion and
+insertion candidates are layout-independent and unaffected either way.
+
 ---
 
 For what's deliberately *not* built yet — larger edit distances,
-non-US keyboard layouts, dictionary-based candidates, GPU-accelerated
+a Dvorak layout map, dictionary-based candidates, GPU-accelerated
 search — see the [Roadmap section of the README](../README.md#roadmap).

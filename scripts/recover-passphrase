@@ -15,6 +15,7 @@ DO_SUBSTITUTION=1
 DO_DELETION=1
 DO_INSERTION=1
 INSERT_CHARS='0123456789!@#$%^&*_-.'
+LAYOUT='qwerty'
 
 usage() {
     cat <<EOF
@@ -28,16 +29,20 @@ dropped, or extra character. Not a general brute-force tool - see
 docs/passphrase-recovery.md.
 
 Options:
-  --no-substitution     Skip QWERTY-adjacency / shift-symbol substitution candidates.
-  --no-deletion         Skip single-character deletion candidates.
-  --no-insertion        Skip single-character insertion candidates.
-  --insert-chars STR    Character set to try inserting (default: $INSERT_CHARS).
-  -h, --help            Show this help and exit.
+  --layout NAME          Physical keyboard layout for substitution
+                          adjacency: qwerty (default), azerty, qwertz.
+                          Use whichever layout the passphrase was
+                          actually typed on when the typo happened.
+  --no-substitution      Skip keyboard-adjacency / shift-symbol substitution candidates.
+  --no-deletion          Skip single-character deletion candidates.
+  --no-insertion         Skip single-character insertion candidates.
+  --insert-chars STR     Character set to try inserting (default: $INSERT_CHARS).
+  -h, --help             Show this help and exit.
 
 Requires root (cryptsetup needs raw device access to test a passphrase).
 
 Example:
-  sudo $PROG /dev/sdX 'my-best-guess-passphrase'
+  sudo $PROG --layout azerty /dev/sdX 'my-best-guess-passphrase'
 EOF
 }
 
@@ -72,6 +77,11 @@ while [ $# -gt 0 ]; do
             INSERT_CHARS="$2"
             shift 2
             ;;
+        --layout)
+            [ $# -ge 2 ] || die "--layout requires an argument"
+            LAYOUT="$2"
+            shift 2
+            ;;
         -*)
             die "unknown option: $1 (see --help)"
             ;;
@@ -91,18 +101,25 @@ done
 [ -n "$DEVICE" ] && [ -n "$GUESS" ] || { usage >&2; exit 1; }
 [ -b "$DEVICE" ] || [ -f "$DEVICE" ] || die "$DEVICE is not a block device or file"
 command -v cryptsetup >/dev/null 2>&1 || die "cryptsetup not found in PATH"
+case "$LAYOUT" in
+    qwerty|azerty|qwertz) ;;
+    *) die "unknown --layout '$LAYOUT' (supported: qwerty, azerty, qwertz)" ;;
+esac
 
 if [ "$(id -u)" -ne 0 ]; then
     die "must be run as root (cryptsetup needs raw device access)"
 fi
 
-# Adjacency reflects physical QWERTY neighbors plus shift/symbol pairs
+# Adjacency reflects physical keyboard neighbors plus shift/symbol pairs
 # sharing a key - these are the substitution slips a typing finger or a
 # half-remembered passphrase actually produces, not a random character map.
+# Dispatches on $LAYOUT to one of three per-layout tables below, since a
+# physical typo on an AZERTY or QWERTZ keyboard lands on a different
+# neighboring key than the same typo on QWERTY.
 #
 # POSIX-safe replacement for bash's `declare -A ADJACENT=(...)`: a
 # case statement mapping each character to its adjacency string.
-adjacent_chars() {
+adjacent_chars_qwerty() {
     case "$1" in
         a) echo "qwsz" ;;
         b) echo "vghn" ;;
@@ -144,10 +161,117 @@ adjacent_chars() {
     esac
 }
 
+# QWERTZ (German): physically identical to QWERTY except the Y and Z
+# keys are swapped - every other key, including the whole number row,
+# sits in the same place. Derived mechanically from the QWERTY table
+# above by swapping y<->z everywhere (as a key and as a neighbor).
+adjacent_chars_qwertz() {
+    case "$1" in
+        a) echo "qwsy" ;;
+        b) echo "vghn" ;;
+        c) echo "xdfv" ;;
+        d) echo "serfcx" ;;
+        e) echo "wsdr34" ;;
+        f) echo "drtgvc" ;;
+        g) echo "ftzhbv" ;;
+        h) echo "gzujnb" ;;
+        i) echo "ujko89" ;;
+        j) echo "huikmn" ;;
+        k) echo "jiolm" ;;
+        l) echo "kop" ;;
+        m) echo "njk" ;;
+        n) echo "bhjm" ;;
+        o) echo "iklp90" ;;
+        p) echo "ol0" ;;
+        q) echo "wa12" ;;
+        r) echo "edft45" ;;
+        s) echo "awedxy" ;;
+        t) echo "rfgz56" ;;
+        u) echo "zhji78" ;;
+        v) echo "cfgb" ;;
+        w) echo "qsae23" ;;
+        x) echo "ysdc" ;;
+        y) echo "asx" ;;
+        z) echo "tghu67" ;;
+        1) echo "q2" ;;
+        2) echo "q1w3" ;;
+        3) echo "w2e4" ;;
+        4) echo "e3r5" ;;
+        5) echo "r4t6" ;;
+        6) echo "t5z7" ;;
+        7) echo "z6u8" ;;
+        8) echo "u7i9" ;;
+        9) echo "i8o0" ;;
+        0) echo "o9p" ;;
+        *) echo "" ;;
+    esac
+}
+
+# AZERTY (French): row1 is a-z-e-r-t-y-u-i-o-p (q<->a and w<->z swapped
+# relative to QWERTY), row2 gains a trailing m (q-s-d-f-g-h-j-k-l-m), and
+# row3 loses m and gains w at the front (w-x-c-v-b-n). Derived mechanically
+# from the QWERTY table via the q<->a / w<->z swap, then hand-corrected
+# for m's relocation from the end of row3 to the end of row2 (it now
+# neighbors l/o/p instead of n/j/k).
+adjacent_chars_azerty() {
+    case "$1" in
+        a) echo "zq12" ;;
+        b) echo "vghn" ;;
+        c) echo "xdfv" ;;
+        d) echo "serfcx" ;;
+        e) echo "zsdr34" ;;
+        f) echo "drtgvc" ;;
+        g) echo "ftyhbv" ;;
+        h) echo "gyujnb" ;;
+        i) echo "ujko89" ;;
+        j) echo "huikn" ;;
+        k) echo "jiol" ;;
+        l) echo "kopm" ;;
+        m) echo "lop" ;;
+        n) echo "bhj" ;;
+        o) echo "iklp90" ;;
+        p) echo "ol0m" ;;
+        q) echo "azsw" ;;
+        r) echo "edft45" ;;
+        s) echo "qzedxw" ;;
+        t) echo "rfgy56" ;;
+        u) echo "yhji78" ;;
+        v) echo "cfgb" ;;
+        w) echo "qsx" ;;
+        x) echo "wsdc" ;;
+        y) echo "tghu67" ;;
+        z) echo "asqe23" ;;
+        1) echo "a2" ;;
+        2) echo "a1z3" ;;
+        3) echo "z2e4" ;;
+        4) echo "e3r5" ;;
+        5) echo "r4t6" ;;
+        6) echo "t5y7" ;;
+        7) echo "y6u8" ;;
+        8) echo "u7i9" ;;
+        9) echo "i8o0" ;;
+        0) echo "o9p" ;;
+        *) echo "" ;;
+    esac
+}
+
+adjacent_chars() {
+    case "$LAYOUT" in
+        azerty) adjacent_chars_azerty "$1" ;;
+        qwertz) adjacent_chars_qwertz "$1" ;;
+        *)      adjacent_chars_qwerty "$1" ;;
+    esac
+}
+
 # POSIX-safe replacement for bash's `declare -A SHIFT_PAIR=(...)` plus
 # the reverse-mapping loop that filled in both directions: a single
-# case statement listing both directions explicitly.
-shift_pair() {
+# case statement listing both directions explicitly. This table is the
+# same across all three layouts EXCEPT azerty, which additionally gets
+# a few ASCII-safe digit<->symbol pairs appended below (azerty's number
+# row types symbols unshifted and digits shifted - most of those symbols
+# are accented/non-ASCII and are deliberately left out, since this tool
+# only searches ASCII passphrase candidates).
+shift_pair_common() {
     case "$1" in
         1) echo "!" ;;
         2) echo "@" ;;
@@ -185,6 +309,32 @@ shift_pair() {
         ":") echo ";" ;;
         *) echo "" ;;
     esac
+}
+
+# ASCII-safe subset of AZERTY's unshifted-symbol/shifted-digit number
+# row: 1<->& (key 1), 4<->' (key 4), 5<->( (key 5). The remaining keys
+# on that row (2, 3, 6, 7, 8, 9, 0) unshift to accented or non-ASCII
+# characters (e, ", -, e-grave, _, c-cedilla, a-grave) and are skipped.
+shift_pair_azerty_extra() {
+    case "$1" in
+        1) echo "&" ;;
+        "&") echo "1" ;;
+        4) echo "'" ;;
+        "'") echo "4" ;;
+        5) echo "(" ;;
+        "(") echo "5" ;;
+        *) echo "" ;;
+    esac
+}
+
+shift_pair() {
+    common="$(shift_pair_common "$1")"
+    if [ "$LAYOUT" = "azerty" ]; then
+        extra="$(shift_pair_azerty_extra "$1")"
+        printf '%s%s' "$common" "$extra"
+    else
+        printf '%s' "$common"
+    fi
 }
 
 # POSIX-safe substring helpers, replacing bash's ${var:offset:length}.
