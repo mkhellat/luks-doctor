@@ -50,9 +50,44 @@ and hope." The rest of this document is that construction.
 
 ## The real algorithm, in plain English
 
-This describes the actual algorithm in `cryptsetup`'s `lib/luks1/af.c`
-(`AF_split`/`AF_merge`, unchanged in LUKS2), unaltered — just narrated in
-words before you see it in bytes.
+This describes the actual algorithm implemented in `cryptsetup`'s
+`lib/luks1/af.c` (function names `AF_split`, `AF_merge`, and their
+`diffuse`/`hash_buf` helpers; unchanged in LUKS2, which reuses the LUKS1
+AF-splitter as-is) — unaltered, just narrated in words before you see it
+in bytes. Source, so you can check this yourself rather than take the
+narration on faith:
+[`lib/luks1/af.c` at commit `fb6b9480`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/fb6b9480fa519c70366d6743ec84cb0f3afcc8c7/lib/luks1/af.c)
+(pinned to a specific commit so this link doesn't rot if upstream later
+refactors the file; verified 2026-08-15 that `AF_split`/`AF_merge`/
+`diffuse`/`hash_buf` at that commit are byte-for-byte what's described
+below). The core of `diffuse`'s per-block hashing (`hash_buf`) is:
+
+```c
+static int hash_buf(const char *src, char *dst, uint32_t iv,
+		    size_t len, const char *hash_name)
+{
+	struct crypt_hash *hd = NULL;
+	char *iv_char = (char *)&iv;
+	int r;
+
+	iv = be32_to_cpu(iv);
+	if (crypt_hash_init(&hd, hash_name))
+		return -EINVAL;
+	if ((r = crypt_hash_write(hd, iv_char, sizeof(uint32_t))))
+		goto out;
+	if ((r = crypt_hash_write(hd, src, len)))
+		goto out;
+	r = crypt_hash_final(hd, dst, len);
+out:
+	crypt_hash_destroy(hd);
+	return r;
+}
+```
+
+— i.e. each block's hash input is the block's own index (as a
+big-endian 32-bit integer) followed by the block's bytes. That index
+mix-in is the concrete mechanism behind "the block's position is part
+of what gets hashed," mentioned below.
 
 **Splitting** a key into N stripes:
 
