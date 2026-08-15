@@ -394,6 +394,12 @@ produce long runs of a single repeated byte, obvious repeating patterns,
 or premature all-zero padding. `docs/checking-for-corruption.md` covers
 exactly what to look for.
 
+For a byte-by-byte walkthrough of the actual split/merge algorithm — a
+hand-traceable toy example plus a demonstration of exactly why a single
+flipped bit anywhere in the stripe data makes the key unrecoverable, not
+just harder to recover — see
+[`af-splitting-explained.md`](af-splitting-explained.md).
+
 ## Primary vs. secondary header: legitimate differences
 
 LUKS2 stores **two independent copies** of the binary header + JSON

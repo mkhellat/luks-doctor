@@ -94,6 +94,11 @@ and secondary headers legitimately differ — is in
 - [`docs/luks2-header-anatomy.md`](docs/luks2-header-anatomy.md) — LUKS2
   header/keyslot structure, JSON metadata, Argon2id, AF-splitting,
   primary/secondary header differences, command reference.
+- [`docs/af-splitting-explained.md`](docs/af-splitting-explained.md) —
+  beginner-friendly, byte-by-byte deep dive into the AF-split/merge
+  algorithm itself, with a hand-traceable worked example and a concrete
+  demonstration of why a single flipped bit makes a keyslot
+  unrecoverable.
 - [`docs/checking-for-corruption.md`](docs/checking-for-corruption.md) —
   practical `dd`/`xxd` inspection walkthrough, healthy vs. corrupted
   example dumps, when `cryptsetup repair` helps and when it can't, and

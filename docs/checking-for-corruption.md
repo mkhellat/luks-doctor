@@ -113,7 +113,10 @@ see its `--help` output.
 ## What healthy key material looks like
 
 A keyslot's `area` holds AF-striped, encrypted key material (see
-[AF-splitting](luks2-header-anatomy.md#af-splitting-anti-forensic-splitting)).
+[AF-splitting](luks2-header-anatomy.md#af-splitting-anti-forensic-splitting),
+or [`af-splitting-explained.md`](af-splitting-explained.md) for a
+byte-by-byte worked example of why this makes partial damage
+unrecoverable).
 Correctly written, this data is **cryptographically indistinguishable
 from uniform random noise** — there is no structure, no repeating
 pattern, no predictable byte at any position. That's expected and
