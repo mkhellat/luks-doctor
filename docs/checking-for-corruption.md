@@ -239,6 +239,34 @@ What you're actually checking for here is not "are these identical"
 sudo cryptsetup repair /dev/sdX
 ```
 
+**What success looks like** — `repair` found nothing wrong, or fixed
+something and reports it, then exits quietly with status 0:
+
+```
+$ sudo cryptsetup repair /dev/sdX
+$ echo $?
+0
+```
+
+Don't be alarmed by the lack of output on a clean header — silence means
+"nothing to do," not "didn't run." If it actually resyncs a header copy,
+it prints a line saying so before exiting 0.
+
+**What failure looks like** — a non-zero exit and an explicit error
+naming what it couldn't reconcile, e.g.:
+
+```
+$ sudo cryptsetup repair /dev/sdX
+Device size is not aligned to requested sector size alignment (4096 bytes).
+$ echo $?
+1
+```
+
+or a message that both header copies are damaged beyond repair. If you get
+an error here instead of quiet success, `repair` did not fix your header —
+proceed to a header restore from backup (see the decision guide below), or
+treat the structural damage as unrecovered.
+
 **What it fixes**: structural damage to the JSON metadata area — e.g.
 a JSON document that fails to parse, a checksum mismatch on one header
 copy that can be repaired by resyncing from the other valid copy, or
