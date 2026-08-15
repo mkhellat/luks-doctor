@@ -106,7 +106,7 @@ What each part does:
   readable hex+ASCII dump instead of dumping raw binary to your
   terminal.
 
-`scripts/inspect-keyslot.sh` does this computation and extraction for
+`scripts/inspect-keyslot` does this computation and extraction for
 you automatically, including handling the case of multiple keyslots —
 see its `--help` output.
 
@@ -148,7 +148,7 @@ What makes this "look healthy" to the eye:
   single printable bytes purely by chance are normal and expected in
   high-entropy data.
 
-This is the pattern `scripts/inspect-keyslot.sh`'s heuristic check is
+This is the pattern `scripts/inspect-keyslot`'s heuristic check is
 built around — see that script's `--help` for exactly what it flags.
 
 ## What corrupted key material looks like
@@ -196,11 +196,29 @@ repeated byte pair, is not automatically damning — real random data
 does occasionally produce short coincidental runs by chance, especially
 in a large keyslot area (hundreds of KB). What matters is runs and
 patterns that are implausibly long to occur by chance, or that persist
-across a large fraction of the area. This is why the heuristic in
-`scripts/inspect-keyslot.sh` is explicitly a rough visual aid with a
-threshold, not a rigorous statistical entropy test — for anything
+across a large fraction of the area. This is why the heuristics in
+`scripts/inspect-keyslot` are explicitly rough visual aids with
+thresholds, not a rigorous statistical entropy test — for anything
 approaching a real forensic determination, use a proper entropy/chi-
 squared analysis tool, not this project.
+
+**A more fundamental limitation, not just a caveat**: both heuristics
+(long zero-runs, repeating patterns) only catch damage that leaves a
+*structural* signature — a write that stopped partway, or a region that
+got overwritten with a fill pattern. Neither one, nor any visual or
+statistical inspection method, can catch a single flipped bit (or a
+handful of flipped bits) scattered through otherwise-intact key
+material. Because of AF-splitting's diffusion step (SHA-256 by
+default), a single bit flip anywhere in the stripe data still produces
+output that's statistically indistinguishable from correct, healthy
+noise — see
+[`af-splitting-explained.md`](af-splitting-explained.md#why-this-makes-corruption-unrecoverable-three-demonstrations)
+for a worked demonstration of exactly why. LUKS2 keyslot areas carry no
+checksum or ECC layer of their own to catch this kind of damage — if
+you suspect subtle bit-level corruption (a failing drive with silent
+read errors, for instance) rather than gross truncation or a fill
+pattern, these heuristics won't tell you either way; your only real
+defense is a `luksHeaderBackup` taken before the damage occurred.
 
 ## Diffing primary vs. secondary headers
 

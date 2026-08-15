@@ -297,7 +297,7 @@ Area length: 258048  [bytes]
 the keyslot's raw data occupies bytes `[32768, 32768 + 258048)` =
 `[32768, 290816)` on the device. You can extract exactly that range with
 `dd` — see `docs/checking-for-corruption.md` for the precise command and
-what to look for in the output. `scripts/inspect-keyslot.sh` automates
+what to look for in the output. `scripts/inspect-keyslot` automates
 this computation so you never have to do the arithmetic by hand.
 
 Note that `Area length` is deliberately larger than the master key

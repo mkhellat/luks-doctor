@@ -8,27 +8,45 @@
 set -eu
 
 PROG="$(basename "$0")"
-ZERO_RUN_THRESHOLD=32   # bytes; see usage note below on why this is a rough heuristic
+ZERO_RUN_THRESHOLD=32     # bytes; see usage note below on why this is a rough heuristic
+PATTERN_REPEAT_THRESHOLD=6  # consecutive repeats of a period (1-8 bytes) to flag
 HEAD_TAIL_BYTES=128
 
 usage() {
     cat <<EOF
-Usage: $PROG [--slot N] [--zero-threshold N] /dev/sdX
+Usage: $PROG [--slot N] [--zero-threshold N] [--pattern-threshold N] /dev/sdX
 
 Inspect a LUKS2 keyslot's raw on-disk key material.
 
 Dumps the head and tail of the keyslot's AF-striped area (via dd+xxd)
-and runs a rough heuristic check for long zero-byte runs, which can
-indicate a truncated or corrupted write. This is NOT a rigorous entropy
-test - it is a quick visual aid. See docs/checking-for-corruption.md
-for what healthy vs. corrupted output actually looks like and how to
-interpret it.
+and runs two rough heuristic checks: long zero-byte runs (truncated or
+zero-filled writes) and short repeating multi-byte patterns, 1-8 bytes
+wide (fill-pattern or cyclic-buffer artifacts, e.g. a "deadbeef deadbeef
+..." style overwrite). Neither is a rigorous entropy test - both are
+quick visual aids. See docs/checking-for-corruption.md for what healthy
+vs. corrupted output actually looks like and how to interpret it.
+
+IMPORTANT LIMITATION: neither heuristic, nor any visual/statistical
+inspection method, can detect a single flipped bit (or any small number
+of flipped bits) scattered through otherwise-correct key material. Per
+AF-splitting's diffusion step (SHA-256 by default - see
+docs/af-splitting-explained.md), a single bit flip anywhere in the
+stripe data still looks like uniform random noise; it does not produce
+a zero-run, a repeating pattern, or any other visible artifact. LUKS2
+keyslot areas carry no checksum or ECC layer of their own to catch this
+- these heuristics can only catch damage that leaves a structural
+signature (truncation, fill patterns), not damage that leaves none.
 
 Options:
-  --slot N              Inspect keyslot N directly, skipping the prompt.
-  --zero-threshold N    Flag zero-byte runs of at least N bytes as
-                         suspicious (default: $ZERO_RUN_THRESHOLD).
-  -h, --help             Show this help and exit.
+  --slot N                Inspect keyslot N directly, skipping the prompt.
+  --zero-threshold N       Flag zero-byte runs of at least N bytes as
+                           suspicious (default: $ZERO_RUN_THRESHOLD).
+  --pattern-threshold N    Flag a repeating pattern (period 1-8 bytes)
+                           that recurs at least N times consecutively
+                           (default: $PATTERN_REPEAT_THRESHOLD; on true
+                           random data, expect ~0 at this threshold
+                           across a keyslot-sized region).
+  -h, --help               Show this help and exit.
 
 Requires root (or equivalent raw device read access).
 
@@ -60,6 +78,11 @@ while [ $# -gt 0 ]; do
         --zero-threshold)
             [ $# -ge 2 ] || die "--zero-threshold requires an argument"
             ZERO_RUN_THRESHOLD="$2"
+            shift 2
+            ;;
+        --pattern-threshold)
+            [ $# -ge 2 ] || die "--pattern-threshold requires an argument"
+            PATTERN_REPEAT_THRESHOLD="$2"
             shift 2
             ;;
         -*)
@@ -145,16 +168,50 @@ echo "--- tail (last $HEAD_TAIL_BYTES bytes) ---"
 printf '%s\n' "$RAW_HEX" | tail -n "$((HEAD_TAIL_BYTES / 16))"
 echo
 
-# Rough heuristic only: count the longest run of the zero byte in the
-# raw area. Real high-entropy ciphertext can produce short coincidental
-# runs by chance; this is a visual aid to catch gross truncation/wipe
-# damage, not a statistical corruption proof. See docs/checking-for-corruption.md.
-LONGEST_ZERO_RUN="$(dd if="$DEVICE" bs=1 skip="$AREA_OFFSET" count="$AREA_LENGTH" 2>/dev/null | \
+# Both heuristics below read the same byte stream once (via a single
+# `od` dump piped to awk) rather than re-reading the device twice.
+#
+# Rough heuristics only:
+#  - longest run of the zero byte (truncated/zero-filled write)
+#  - longest run of a short (1-8 byte) repeating pattern (fill-pattern
+#    or cyclic-buffer overwrite, e.g. "deadbeef deadbeef ...")
+# Real high-entropy ciphertext can produce short coincidental runs of
+# either kind by chance; these are visual aids to catch gross
+# truncation/wipe/fill damage, not a statistical corruption proof, and
+# critically do NOT catch single-bit-flip corruption (see the
+# IMPORTANT LIMITATION note in --help). See docs/checking-for-corruption.md.
+HEURISTIC_RESULT="$(dd if="$DEVICE" bs=1 skip="$AREA_OFFSET" count="$AREA_LENGTH" 2>/dev/null | \
     od -An -tu1 -v | tr -s ' ' '\n' | awk '
-        $0 == "0" { run++; if (run > max) max = run; next }
-        { run = 0 }
-        END { print max + 0 }
+        NF { n++; b[n] = $0 }
+        END {
+            zero_max = 0
+            run = 0
+            for (i = 1; i <= n; i++) {
+                if (b[i] == "0") { run++; if (run > zero_max) zero_max = run }
+                else { run = 0 }
+            }
+
+            pattern_max = 0
+            pattern_period = 0
+            for (period = 1; period <= 8; period++) {
+                run = 0
+                for (i = period + 1; i <= n; i++) {
+                    if (b[i] == b[i - period]) {
+                        run++
+                        if (run > pattern_max) { pattern_max = run; pattern_period = period }
+                    } else {
+                        run = 0
+                    }
+                }
+            }
+
+            print zero_max, pattern_max, pattern_period
+        }
     ')"
+
+LONGEST_ZERO_RUN="$(printf '%s' "$HEURISTIC_RESULT" | cut -d' ' -f1)"
+LONGEST_PATTERN_RUN="$(printf '%s' "$HEURISTIC_RESULT" | cut -d' ' -f2)"
+LONGEST_PATTERN_PERIOD="$(printf '%s' "$HEURISTIC_RESULT" | cut -d' ' -f3)"
 
 echo "Longest zero-byte run in keyslot area: $LONGEST_ZERO_RUN bytes"
 if [ "$LONGEST_ZERO_RUN" -ge "$ZERO_RUN_THRESHOLD" ]; then
@@ -164,3 +221,18 @@ if [ "$LONGEST_ZERO_RUN" -ge "$ZERO_RUN_THRESHOLD" ]; then
 else
     echo "No suspiciously long zero-runs found (threshold: $ZERO_RUN_THRESHOLD bytes)."
 fi
+
+echo "Longest repeating-pattern run: $LONGEST_PATTERN_RUN consecutive repeats (period $LONGEST_PATTERN_PERIOD byte(s))"
+if [ "$LONGEST_PATTERN_RUN" -ge "$PATTERN_REPEAT_THRESHOLD" ]; then
+    echo "NOTE: this exceeds the pattern-repeat threshold ($PATTERN_REPEAT_THRESHOLD repeats)."
+    echo "      A short pattern repeating this many times in a row is not"
+    echo "      something real random key material produces by chance - see"
+    echo "      docs/checking-for-corruption.md for how to interpret it."
+else
+    echo "No suspiciously long repeating patterns found (threshold: $PATTERN_REPEAT_THRESHOLD repeats)."
+fi
+
+echo
+echo "Reminder: these are rough structural heuristics only. They cannot"
+echo "detect single-bit-flip corruption, which produces no visible"
+echo "signature - see docs/af-splitting-explained.md for why."
