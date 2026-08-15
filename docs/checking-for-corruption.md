@@ -20,12 +20,31 @@ inspection work on a device you care about.
 
 ## Contents
 
+- [Confirm you have the right device](#confirm-you-have-the-right-device)
 - [Extracting a keyslot's raw bytes with `dd`](#extracting-a-keyslots-raw-bytes-with-dd)
 - [What healthy key material looks like](#what-healthy-key-material-looks-like)
 - [What corrupted key material looks like](#what-corrupted-key-material-looks-like)
 - [Diffing primary vs. secondary headers](#diffing-primary-vs-secondary-headers)
 - [When to run `cryptsetup repair`, and what it can't fix](#when-to-run-cryptsetup-repair-and-what-it-cant-fix)
 - [Decision guide](#decision-guide)
+
+## Confirm you have the right device
+
+Before touching anything, confirm `/dev/sdX` is actually the LUKS device you
+think it is — everything below reads and interprets raw bytes at absolute
+offsets, and running it against the wrong device (a stale path after a USB
+re-enumeration, a similarly-named device, a partition vs. the whole disk)
+produces confusing garbage that looks exactly like corruption but isn't:
+
+```
+sudo blkid /dev/sdX
+```
+
+Expect `TYPE="crypto_LUKS"` in the output. If `blkid` shows a different type,
+shows nothing, or the device node doesn't match what you expect from
+`lsblk`/`dmesg` (e.g. after replugging a USB enclosure, which can reassign
+`/dev/sdX` letters), stop and re-identify the device before proceeding — do
+not extrapolate corruption findings from the wrong device.
 
 ## Extracting a keyslot's raw bytes with `dd`
 
