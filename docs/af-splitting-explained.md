@@ -60,7 +60,25 @@ narration on faith:
 (pinned to a specific commit so this link doesn't rot if upstream later
 refactors the file; verified 2026-08-15 that `AF_split`/`AF_merge`/
 `diffuse`/`hash_buf` at that commit are byte-for-byte what's described
-below). The core of `diffuse`'s per-block hashing (`hash_buf`) is:
+below).
+
+Before the code: what's `diffuse`, structurally, before you see how it
+hashes? It's a function that takes the accumulator buffer (same size as
+the key — for real LUKS2, 32+ bytes) and scrambles it, using a hash
+function, in a way that's easy to redo (merge needs to reproduce the
+exact same scramble) but impossible to invert without the accumulator's
+prior value. One detail matters for the worked example below: **a hash
+function only processes one digest-sized block at a time** (SHA-256's
+digest is 32 bytes), so if the accumulator is *larger* than one digest,
+`diffuse` chops it into digest-sized blocks and hashes each block
+separately — mixing in that block's own position (`0`, `1`, `2`, ...) as
+part of the hash input, so block 0 and block 1 of the same buffer hash
+differently even if their raw bytes happened to match. That per-block
+hash step is `hash_buf`, shown below. (The toy example further down uses
+a 2-byte accumulator — smaller than one SHA-256 digest — so it only ever
+has *one* block and never exercises this chopping step. Flagged again
+where it matters, in
+[Mapping the toy example back to real LUKS2](#mapping-the-toy-example-back-to-real-luks2).)
 
 ```c
 static int hash_buf(const char *src, char *dst, uint32_t iv,
@@ -84,12 +102,88 @@ out:
 }
 ```
 
-— i.e. each block's hash input is the block's own index (as a
+— i.e. each block's hash input is the block's own index (`iv`, as a
 big-endian 32-bit integer) followed by the block's bytes. That index
 mix-in is the concrete mechanism behind "the block's position is part
-of what gets hashed," mentioned below.
+of what gets hashed," mentioned above. `hash_buf` itself doesn't decide
+how many blocks there are — that's `diffuse`, which calls it once per
+digest-sized block:
 
-**Splitting** a key into N stripes:
+```c
+static int diffuse(char *src, char *dst, size_t size, const char *hash_name)
+{
+	int r, hash_size = crypt_hash_size(hash_name);
+	unsigned int digest_size;
+	unsigned int i, blocks, padding;
+
+	if (hash_size <= 0)
+		return -EINVAL;
+	digest_size = hash_size;
+
+	blocks = size / digest_size;
+	padding = size % digest_size;
+
+	for (i = 0; i < blocks; i++) {
+		r = hash_buf(src + digest_size * i,
+			    dst + digest_size * i,
+			    i, (size_t)digest_size, hash_name);
+		if (r < 0)
+			return r;
+	}
+
+	if (padding) {
+		r = hash_buf(src + digest_size * i,
+			    dst + digest_size * i,
+			    i, (size_t)padding, hash_name);
+		if (r < 0)
+			return r;
+	}
+
+	return 0;
+}
+```
+
+This confirms the claim above precisely: `blocks = size / digest_size`
+whole blocks, each hashed with index `i` via `hash_buf`, plus one final
+short call for any remainder (`padding`). For a 32-byte accumulator with
+SHA-256 (32-byte digest), `blocks = 1` and `padding = 0` — exactly one
+`hash_buf` call, index `0`. That's the case the toy example (and real
+256-bit LUKS2 keys) land in; a larger accumulator would mean `blocks > 1`
+and multiple indexed calls, as described above. `struct crypt_hash` and
+`crypt_hash_init`/`_write`/`_final`/`_destroy` are not part of
+AF-splitting itself — they're cryptsetup's internal wrapper around
+whichever real crypto library it's built against (OpenSSL, gcrypt, NSS,
+or the kernel crypto API), so this code can call a generic "hash
+something" API without caring which backend is compiled in. The opaque
+type is declared in
+[`lib/crypto_backend/crypto_backend.h`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/fb6b9480fa519c70366d6743ec84cb0f3afcc8c7/lib/crypto_backend/crypto_backend.h#L28-49);
+the OpenSSL backend's concrete definition (a thin wrapper around
+`EVP_MD_CTX`) is in
+[`lib/crypto_backend/crypto_openssl.c`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/fb6b9480fa519c70366d6743ec84cb0f3afcc8c7/lib/crypto_backend/crypto_openssl.c#L55-57).
+Nothing about that indirection changes the algorithm — skip it if you
+just want the data flow.
+
+**Splitting** a key into N stripes, pictured first, then as steps. Read
+top to bottom — `buf` is the one accumulator, updated in place at each
+row:
+
+```
+buf = 00...00                        (all-zero, key-sized)
+
+stripe[0] (random)  --XOR-->  buf
+                     buf = diffuse(buf)
+
+stripe[1] (random)  --XOR-->  buf
+                     buf = diffuse(buf)
+
+        ...                         (repeat for every stripe except the last)
+
+stripe[N-2] (random) --XOR-->  buf
+                     buf = diffuse(buf)
+
+stripe[N-1] = original_key XOR buf   (NOT random -- the real key enters
+                                       only here, XORed with the final buf)
+```
 
 1. Start with an all-zero "accumulator" buffer, the same size as the key.
 2. For each stripe *except the last* (stripes `0` through `N-2`):
@@ -103,7 +197,9 @@ of what gets hashed," mentioned below.
    original key XORed with whatever the accumulator holds after all
    those rounds.
 
-**Merging** stripes back into the key reverses this exactly:
+**Merging** stripes back into the key reverses this exactly — same
+pipeline, read the diagram above top-to-bottom again, except the last
+step is an XOR *out* instead of *in*:
 
 1. Start with the same all-zero accumulator.
 2. For each stripe *except the last*, in the same order: XOR it into the
@@ -113,10 +209,8 @@ of what gets hashed," mentioned below.
 3. XOR the final stripe with the (now fully reconstructed) accumulator.
    The result is the original key.
 
-The `diffuse` function itself is simple: chop its input into
-hash-digest-sized blocks, and hash each block individually, mixing in the
-block's position (`0`, `1`, `2`, ...) as part of what gets hashed. This
-mixing-in-of-position is what a cryptsetup source comment calls
+The mixing-in-of-position inside `diffuse` (the `iv`/block-index in
+`hash_buf`, above) is what a cryptsetup source comment calls
 "anti-forensic" — combined with the XOR chain above, it's specifically
 what guarantees a partial stripe set carries no information (see
 [Why this makes corruption unrecoverable](#why-this-makes-corruption-unrecoverable-three-demonstrations)
@@ -201,9 +295,11 @@ stripe[2] = src XOR buf
 **What actually gets written to the keyslot's `area` on disk:**
 
 ```
-stripe[0] = 11 22
-stripe[1] = 77 88
-stripe[2] = c3 90
+stripe[0]  stripe[1]  stripe[2]
+┌───────┐ ┌───────┐  ┌───────┐
+│ 11 22 │ │ 77 88 │  │ c3 90 │      6 bytes total, laid out
+└───────┘ └───────┘  └───────┘      end-to-end in `area`
+ random     random    key XOR buf
 ```
 
 Notice: none of these three stripes, read individually, look like `a5 3c`
@@ -299,7 +395,7 @@ it's not key data at all.
 
 ## Mapping the toy example back to real LUKS2
 
-Real LUKS2 differs from the toy example in three ways, all of which make
+Real LUKS2 differs from the toy example in four ways, all of which make
 the anti-forensic property *stronger*, not different in kind:
 
 - **SHA-256 instead of toy addition.** SHA-256 is a real one-way hash
@@ -318,6 +414,21 @@ the anti-forensic property *stronger*, not different in kind:
   bigger than the master key itself (see
   [`luks2-header-anatomy.md#reading-area-offset--area-length`](luks2-header-anatomy.md#reading-area-offset--area-length)):
   4000 stripes of a 32-byte key is 128,000 bytes, not 32.
+- **`diffuse` chops the accumulator into digest-sized blocks — the toy
+  example never does this.** The toy accumulator is 2 bytes, smaller
+  than a single SHA-256 digest (32 bytes), so every `toy_diffuse` call
+  above hashed (added-to, really) exactly one block. Real LUKS2's
+  accumulator is also key-sized (32+ bytes) but SHA-256's digest is also
+  32 bytes, so for a 256-bit key the accumulator still happens to fit in
+  one block; for a *larger* key (e.g. a 512-bit key from a different
+  cipher configuration) `diffuse` would chop the accumulator into
+  multiple 32-byte blocks and hash each one separately with its own
+  block index, mixing them back together. The toy example's single-XOR,
+  single-hash-call structure per stripe is accurate for a 256-bit key;
+  it undersells what `diffuse` does for anything larger. See
+  [The real algorithm, in plain English](#the-real-algorithm-in-plain-english)
+  for where this chopping step lives in the real code (`hash_buf`,
+  called once per block by `diffuse`).
 
 None of these differences change the *shape* of the argument in the
 [three demonstrations](#why-this-makes-corruption-unrecoverable-three-demonstrations)
