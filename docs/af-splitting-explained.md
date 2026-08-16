@@ -34,23 +34,69 @@ LUKS2 doesn't mandate a single master-key length — it's whatever the
 cipher and key size chosen at `luksFormat` time require, recorded per
 keyslot as `key_size` (in bytes) in the keyslot's own JSON metadata (see
 [`luks2-header-anatomy.md#the-json-metadata-area`](luks2-header-anatomy.md#the-json-metadata-area)).
-`cryptsetup`'s own compiled-in default is `aes-xts-plain64` with a
-256-bit cipher key — but XTS mode needs *two* independent sub-keys, so
-`cryptsetup` automatically doubles that to a 512-bit (64-byte) volume
-key unless you pass `--key-size` explicitly (source:
-[`configure.ac`](https://gitlab.com/cryptsetup/cryptsetup/-/raw/main/configure.ac),
-`luks1-keybits` defaults to 256 and `ENABLE_LUKS_ADJUST_XTS_KEYSIZE` —
-on by default — doubles it for XTS). 32 bytes (256-bit) is a real,
-common value too — it's the exact figure used in the LUKS2 on-disk
-format spec's own worked example — just not a fixed universal constant.
-This document uses 32 bytes purely because it's a familiar round number;
-nothing below depends on that specific length.
+`cryptsetup`'s own compiled-in default cipher is `aes-xts-plain64`,
+which needs a 512-bit (64-byte) volume key by construction — not
+because cryptsetup pads or doubles a smaller key, but because an
+XTS-mode key *is* two independent, equal-length AES keys concatenated
+end to end (`key1 || key2`; each half is a full, separate AES-256 key
+here, not half an AES-256 key). One half encrypts the actual data
+block; the other half encrypts a per-sector "tweak" value that gets
+mixed in before and after the main encryption (the XEX construction —
+XOR-Encrypt-XOR). Confirmed directly in the Linux kernel's XTS
+implementation, which is what dm-crypt (and therefore LUKS2) actually
+calls at unlock time:
+
+```c
+static int xts_setkey(struct crypto_skcipher *parent, const u8 *key,
+		      unsigned int keylen)
+{
+	...
+	err = xts_verify_key(parent, key, keylen);
+	if (err)
+		return err;
+
+	keylen /= 2;
+
+	/* we need two cipher instances: one to compute the initial 'tweak'
+	 * by encrypting the IV (usually the 'plain' iv) and the other
+	 * to encrypt the data */
+	...
+```
+(`crypto/xts.c`, `xts_setkey()`, Linux kernel source —
+[`crypto/xts.c` on kernel.org's git mirror](https://github.com/torvalds/linux/blob/master/crypto/xts.c),
+verified 2026-08-16; `xts_verify_key()`, called just above, actively
+*rejects* a key whose two halves are equal — using the same key twice
+is a real, documented weakness in XTS, not just wasteful, per NIST SP
+800-38E Annex C.1 and FIPS 140-2 IG A.9). So `--cipher aes-xts-plain64`
+with no `--key-size` needs 512 bits total specifically because a
+256-bit *tweak* key and a 256-bit *data* key both have to exist and be
+independent — there's no smaller "real" master key underneath that gets
+inflated; the 512-bit value *is* the pair.
+
+cryptsetup encodes this as a doubling rule relative to a *different*
+cipher's expectation, because its internal default-size constant
+(`default_size_bits`) is shared across cipher families and represents
+"AES-256, single key" — the natural default for non-XTS modes like
+`aes-cbc-essiv:sha256`, which only ever need one key. For XTS
+specifically, that shared 256-bit constant is doubled to 512 bits so
+the result is still "AES-256, but XTS's two-key shape" rather than
+silently downgrading XTS to two AES-128 keys. See
+[Where key length actually comes from, per code](#where-key-length-actually-comes-from-per-code)
+for the exact code path. 32 bytes (256-bit) is a real, common value too
+— it's the exact figure used in the LUKS2 on-disk format spec's own
+worked example, for a *single*-key mode — just not a fixed universal
+constant. This document uses 32 bytes purely because it's a familiar
+round number; nothing below depends on that specific length.
 
 ### Where key length actually comes from, per code
 
 There are three separate layers here, and conflating them produces
 exactly the kind of "32 bytes is standard" overstatement this section
-just corrected. Each layer's actual behavior, cited directly:
+just corrected. (Layer 3 below talks about cryptsetup "doubling" a
+256-bit default to 512 bits for XTS — that's describing the code's own
+arithmetic, not implying a smaller 256-bit key gets padded; per the
+explanation above, the 512-bit result is two full, independent 256-bit
+keys from the start.) Each layer's actual behavior, cited directly:
 
 1. **LUKS2 on-disk format**: imposes no fixed key length. Each keyslot's
    JSON metadata carries its own `key_size` (bytes) field, and different
