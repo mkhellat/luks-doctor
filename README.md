@@ -205,6 +205,39 @@ their own clearly-labeled script/doc pair rather than folding them into
 the existing edit-distance-1 tool, so the safe/tractable case stays
 simple and the more speculative/expensive methods stay clearly opt-in.
 
+### Research milestones (pre-roadmap)
+
+These two are deeper and more open-ended than the extensions above —
+research/analysis work, not scoped features yet. The intent is for
+their findings to *inform* future roadmap items (e.g. a
+statistically-grounded corruption heuristic to replace or supplement
+`inspect-keyslot`'s current zero-run/pattern-repeat checks, or
+KDF-choice guidance grounded in an actual security comparison rather
+than "argon2id is generally recommended"), not to be implemented
+directly:
+
+- **Entropy/noise analysis of encrypted segments, done quantitatively.**
+  `inspect-keyslot`'s current heuristics (see
+  [`docs/af-splitting-explained.md`](docs/af-splitting-explained.md))
+  are visual/structural — zero-run length, repeating-pattern detection
+  — explicitly *not* a statistical measure, and explicitly incapable of
+  catching single-bit-flip corruption (diffusion makes that
+  information-theoretically invisible, not just hard to detect). A
+  proper deep-dive into entropy/noise/randomness-deficit calculation
+  (chi-squared, NIST SP 800-22 style statistical test suites, or
+  similar) against real AF-striped keyslot data and encrypted data
+  segments, to establish what such analysis *can* and *definitively
+  cannot* detect, replacing "eyeball the hex dump" with actual
+  measurement where measurement is possible.
+- **Argon2id vs. PBKDF2 comparison, LUKS1 vs. LUKS2, done
+  cryptographically.** A rigorous comparison — memory-hardness
+  properties, GPU/ASIC attack cost modeling, actual information
+  leakage from KDF parameters stored in cleartext header/JSON metadata
+  (iteration count, memory cost, salt) — grounding LUKS1-vs-LUKS2 KDF
+  discussion in real cryptanalysis and the relevant math rather than
+  the generic "Argon2id is memory-hard, PBKDF2 isn't" summary this
+  project's docs currently rely on.
+
 ## Contributing
 
 Issues and pull requests are welcome. Shell scripts should pass
