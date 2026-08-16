@@ -17,9 +17,10 @@ cryptographically useless) and focuses entirely on *how*.
 ## Contents
 
 - [The problem AF-splitting solves, restated concretely](#the-problem-af-splitting-solves-restated-concretely)
-  - [Where key length actually comes from, per code](#where-key-length-actually-comes-from-per-code)
-  - [The keyslot JSON object, sketched](#the-keyslot-json-object-sketched)
-  - [A real example, from the spec itself](#a-real-example-from-the-spec-itself)
+  - [Aside: where does that key-length number actually come from?](#aside-where-does-that-key-length-number-actually-come-from)
+    - [Where key length actually comes from, per code](#where-key-length-actually-comes-from-per-code)
+    - [The keyslot JSON object, sketched](#the-keyslot-json-object-sketched)
+    - [A real example, from the spec itself](#a-real-example-from-the-spec-itself)
 - [The real algorithm, in plain English](#the-real-algorithm-in-plain-english)
 - [A worked example you can trace by hand](#a-worked-example-you-can-trace-by-hand)
   - [Splitting the key](#splitting-the-key)
@@ -29,6 +30,35 @@ cryptographically useless) and focuses entirely on *how*.
 - [What this means when you're inspecting a keyslot](#what-this-means-when-youre-inspecting-a-keyslot)
 
 ## The problem AF-splitting solves, restated concretely
+
+Say your LUKS2 volume's master key is *N* bytes. If that key were
+written to disk as-is — even encrypted under your passphrase-derived
+key — an attacker who recovers even a small *fragment* of that region
+(from wear-leveling remnants on an SSD, a bad-block remap, filesystem
+journal residue, whatever) has a fragment of the actual key. Not the
+whole key, but a real, meaningful piece of it, which measurably narrows
+a brute-force search.
+
+AF-splitting's job is to take that *N*-byte key and expand it into many
+"stripes" (4000, by default) such that:
+
+- All 4000 stripes, in order, are needed to reconstruct the original key.
+- Any subset smaller than all 4000 — even 3999 of them — reveals
+  **nothing** about the key. Not "a little less secure," not "narrows the
+  search space slightly." Nothing, in the same sense that XORing a secret
+  with one unknown random byte reveals nothing about the secret.
+
+That second property is the interesting part, and it's not automatic —
+you get it from a specific construction, not from "spread the data out
+and hope." The rest of this document is that construction, worked
+through with a concrete *N* so you can trace real numbers rather than
+reason about an abstract key. Before picking that *N*, though, it's
+worth being precise about what it actually is — because "the master
+key" is not a fixed-size thing LUKS2 defines once; it's determined by
+choices made at `luksFormat` time, and getting that wrong is exactly
+the kind of imprecision this project's docs are supposed to avoid.
+
+### Aside: where does that key-length number actually come from?
 
 LUKS2 doesn't mandate a single master-key length — it's whatever the
 cipher and key size chosen at `luksFormat` time require, recorded per
@@ -105,7 +135,7 @@ worked example, for a *single*-key mode — just not a fixed universal
 constant. This document uses 32 bytes purely because it's a familiar
 round number; nothing below depends on that specific length.
 
-### Where key length actually comes from, per code
+#### Where key length actually comes from, per code
 
 There are three separate layers here, and conflating them produces
 exactly the kind of "32 bytes is standard" overstatement this section
@@ -181,7 +211,7 @@ logic, not a hard limit; `--key-size` overrides it for any cipher, and
 whatever value results still has to pass the live
 `crypt_check_cipher()` test against the running kernel.
 
-### The keyslot JSON object, sketched
+#### The keyslot JSON object, sketched
 
 `key_size` doesn't float free in the JSON — it's one field inside a
 specific nested structure. Every field below is mandatory unless marked
@@ -225,7 +255,7 @@ object, and separately requires the nested `area` object to exist —
 matching the spec's mandatory-fields list above, not just documented
 prose.
 
-### A real example, from the spec itself
+#### A real example, from the spec itself
 
 This isn't a hand-built illustration — it's the LUKS2 On-Disk Format
 Specification's own worked example (§3.1, full header for an
@@ -298,26 +328,16 @@ Change `--cipher` to something in the "doubling applies" rows of the
 table above and both `key_size` fields (top-level and `area.key_size`)
 would read `64` instead, with no other structural change.
 
-Whatever the actual length, the problem AF-splitting solves is the same:
-if that key were written to disk as-is (even encrypted under your
-passphrase-derived key), an attacker who recovers even a small
-*fragment* of that region — from wear-leveling remnants on an SSD, a
-bad-block remap, filesystem journal residue, whatever — has a fragment
-of the actual key. Not the whole key, but a real, meaningful piece of
-it, which measurably narrows a brute-force search.
-
-AF-splitting's job is to take that 32-byte key and expand it into many
-"stripes" (4000, by default) such that:
-
-- All 4000 stripes, in order, are needed to reconstruct the original key.
-- Any subset smaller than all 4000 — even 3999 of them — reveals
-  **nothing** about the key. Not "a little less secure," not "narrows the
-  search space slightly." Nothing, in the same sense that XORing a secret
-  with one unknown random byte reveals nothing about the secret.
-
-That second property is the interesting part, and it's not automatic —
-you get it from a specific construction, not from "spread the data out
-and hope." The rest of this document is that construction.
+That's the full answer to "what is *N*": it's `key_size` from a real
+keyslot, and it's commonly 32 or 64 bytes depending on cipher choice —
+32 being both the spec's own example value and a familiar round number.
+The rest of this document picks **N = 32 bytes** wherever a concrete
+key size is needed (the algorithm walkthrough next, then the fully
+worked toy example further down); nothing about AF-splitting's
+structure or the corruption arguments later in this document depends on
+which of those two common values you have on a real device — only the
+*number* of stripes and the *size* of each stripe scale with it, not the
+underlying logic.
 
 ## The real algorithm, in plain English
 
