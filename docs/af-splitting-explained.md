@@ -17,6 +17,7 @@ cryptographically useless) and focuses entirely on *how*.
 ## Contents
 
 - [The problem AF-splitting solves, restated concretely](#the-problem-af-splitting-solves-restated-concretely)
+  - [Where key length actually comes from, per code](#where-key-length-actually-comes-from-per-code)
 - [The real algorithm, in plain English](#the-real-algorithm-in-plain-english)
 - [A worked example you can trace by hand](#a-worked-example-you-can-trace-by-hand)
   - [Splitting the key](#splitting-the-key)
@@ -42,6 +43,78 @@ common value too — it's the exact figure used in the LUKS2 on-disk
 format spec's own worked example — just not a fixed universal constant.
 This document uses 32 bytes purely because it's a familiar round number;
 nothing below depends on that specific length.
+
+### Where key length actually comes from, per code
+
+There are three separate layers here, and conflating them produces
+exactly the kind of "32 bytes is standard" overstatement this section
+just corrected. Each layer's actual behavior, cited directly:
+
+1. **LUKS2 on-disk format**: imposes no fixed key length. Each keyslot's
+   JSON metadata carries its own `key_size` (bytes) field, and different
+   keyslots on the same volume are explicitly allowed to hold
+   different-sized keys (LUKS2 On-Disk Format Specification v1.1.4,
+   [`docs/on-disk-format-luks2.pdf`](https://gitlab.com/cryptsetup/cryptsetup/-/raw/main/docs/on-disk-format-luks2.pdf),
+   §3.2/§4.2). The format's only real constraint is an upper storage
+   bound (`LUKS_MAX_KEYSLOT_SIZE` in `lib/luks1/luks.h`), not a specific
+   length.
+2. **Kernel / dm-crypt**: cryptsetup does not hardcode a table of
+   "cipher X accepts key sizes Y" — the man page says so outright
+   (`man/cryptsetup.8.adoc`, "Supported ciphers, modes, hashes and key
+   sizes" section): *"The available combinations of ciphers, modes,
+   hashes and key sizes depend on kernel support. See /proc/crypto for a
+   list of available options."* Concretely, `crypt_check_cipher()`
+   (`lib/utils.c`) doesn't consult a lookup table at all — it generates
+   a random key of the requested length and actually attempts the
+   cipher via `crypt_storage_init()`/`crypt_storage_decrypt()`, and
+   rejects `luksFormat` only if that live attempt fails. The kernel
+   crypto API is the real source of truth, not cryptsetup.
+3. **cryptsetup's CLI convenience default**: the *only* place a
+   specific number gets chosen automatically is when you run
+   `luksFormat` without `--key-size`. That path is
+   `get_adjusted_key_size()` in `src/utils_luks.c`:
+
+   ```c
+   int get_adjusted_key_size(const char *cipher, const char *cipher_mode, uint32_t keysize_bits,
+                 uint32_t default_size_bits, int integrity_keysize)
+   {
+   #if ENABLE_LUKS_ADJUST_XTS_KEYSIZE
+       if (!keysize_bits && (!strncmp(cipher_mode, "xts-", 4) || !strncmp(cipher, "capi:xts(", 9))) {
+           if (default_size_bits == 128)
+               keysize_bits = 256;
+           else if (default_size_bits == 256)
+               keysize_bits = 512;
+       }
+   #endif
+       return (keysize_bits ?: default_size_bits) / 8 + integrity_keysize;
+   }
+   ```
+
+   In words: only fires if you didn't pass `--key-size` (`!keysize_bits`)
+   *and* the mode string literally starts with `"xts-"` (or is a
+   `capi:xts(...)` spec) — then it doubles the compiled-in
+   `default_size_bits` (256 → 512 bits). Any other mode (`cbc-essiv:...`,
+   `adiantum-plain64`, etc.) skips this branch entirely and just uses
+   `default_size_bits` (256 bits / 32 bytes) as-is. Source:
+   [`src/utils_luks.c`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/9b560a0d4948cde06a1a961813ee3c01264a185f/src/utils_luks.c#L141-150)
+   (pinned commit `9b560a0d`, verified 2026-08-16).
+
+Concretely, for common `--cipher` choices with no explicit
+`--key-size`:
+
+| `--cipher` value | Mode matches `xts-`? | Doubling applies? | Resulting key |
+|---|---|---|---|
+| `aes-xts-plain64` (the default) | yes | yes | 512 bit / 64 bytes |
+| `serpent-xts-plain64` | yes | yes | 512 bit / 64 bytes |
+| `twofish-xts-plain64` | yes | yes | 512 bit / 64 bytes |
+| `aes-cbc-essiv:sha256` | no | no | 256 bit / 32 bytes |
+| `aes-adiantum-plain64` | no (mode is `adiantum`, not `xts-...`) | no | 256 bit / 32 bytes |
+
+All five rows assume the compiled-in `default_size_bits` of 256 was left
+untouched at build time — this table describes the *default-selection*
+logic, not a hard limit; `--key-size` overrides it for any cipher, and
+whatever value results still has to pass the live
+`crypt_check_cipher()` test against the running kernel.
 
 Whatever the actual length, the problem AF-splitting solves is the same:
 if that key were written to disk as-is (even encrypted under your
