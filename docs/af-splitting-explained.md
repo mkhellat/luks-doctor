@@ -66,8 +66,25 @@ static int xts_setkey(struct crypto_skcipher *parent, const u8 *key,
 [`crypto/xts.c` on kernel.org's git mirror](https://github.com/torvalds/linux/blob/master/crypto/xts.c),
 verified 2026-08-16; `xts_verify_key()`, called just above, actively
 *rejects* a key whose two halves are equal — using the same key twice
-is a real, documented weakness in XTS, not just wasteful, per NIST SP
-800-38E Annex C.1 and FIPS 140-2 IG A.9). So `--cipher aes-xts-plain64`
+is a real, documented weakness in XTS, not just wasteful. NIST SP
+800-38E itself doesn't discuss this (it only has a bibliography
+appendix, no security-rationale annex); the actual requirement and its
+justification live in
+[FIPS 140-2 Implementation Guidance, §A.9 "XTS-AES Key Generation
+Requirements"](https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Module-Validation-Program/documents/fips140-2/FIPS1402IG.pdf)
+(p. 213; renumbered to §C.I under the newer [FIPS 140-3
+IG](https://csrc.nist.gov/csrc/media/Projects/cryptographic-module-validation-program/documents/fips%20140-3/FIPS%20140-3%20IG.pdf),
+p. 141) — verbatim: *"An implementation of XTS-AES that improperly
+generates Key so that Key_1 = Key_2 is vulnerable to a chosen
+ciphertext attack... by obtaining the decryption of only one chosen
+ciphertext block in a given data sector, an adversary who does not
+know the key may be able to manipulate the ciphertext in that sector so
+that one or more plaintext blocks change to any desired value... The
+module shall check explicitly that Key_1 ≠ Key_2."* That IG cites the
+underlying attack to Rogaway, *Efficient Instantiations of Tweakable
+Blockciphers and Refinements to Modes OCB and PMAC* (2004), §6, and to
+IEEE Std 1619-2007 Annex D §D.4.3 (pp. 31–32) for why XTS-AES departs
+from the generic XEX construction on this point. So `--cipher aes-xts-plain64`
 with no `--key-size` needs 512 bits total specifically because a
 256-bit *tweak* key and a 256-bit *data* key both have to exist and be
 independent — there's no smaller "real" master key underneath that gets
