@@ -18,6 +18,8 @@ cryptographically useless) and focuses entirely on *how*.
 
 - [The problem AF-splitting solves, restated concretely](#the-problem-af-splitting-solves-restated-concretely)
   - [Where key length actually comes from, per code](#where-key-length-actually-comes-from-per-code)
+  - [The keyslot JSON object, sketched](#the-keyslot-json-object-sketched)
+  - [A real example, from the spec itself](#a-real-example-from-the-spec-itself)
 - [The real algorithm, in plain English](#the-real-algorithm-in-plain-english)
 - [A worked example you can trace by hand](#a-worked-example-you-can-trace-by-hand)
   - [Splitting the key](#splitting-the-key)
@@ -115,6 +117,123 @@ untouched at build time — this table describes the *default-selection*
 logic, not a hard limit; `--key-size` overrides it for any cipher, and
 whatever value results still has to pass the live
 `crypt_check_cipher()` test against the running kernel.
+
+### The keyslot JSON object, sketched
+
+`key_size` doesn't float free in the JSON — it's one field inside a
+specific nested structure. Every field below is mandatory unless marked
+`optional`; this is the `luks2`-type keyslot object shape (source: LUKS2
+On-Disk Format Specification v1.1.4, §3.2–3.2.5, same PDF as above):
+
+```
+keyslots["<N>"]                         <- keyslot, keyed by slot number as a string
+├── type            "luks2"
+├── key_size        <int, bytes>        <- the field this document keeps citing
+├── priority        <int, optional>     <- 0=ignore, 1=normal, 2=high
+├── af { }                              <- anti-forensic splitting parameters
+│   ├── type        "luks1"             <- only luks1-style AF is currently used
+│   ├── stripes     <int>               <- only 4000 is supported ("historical reasons")
+│   └── hash        <string>            <- diffuse()'s hash, e.g. "sha256"
+├── area { }                            <- where the AF-striped data physically lives
+│   ├── type        "raw"               <- only "raw" is valid for luks2 keyslots
+│   ├── offset      <string-uint64>     <- byte offset from device start
+│   ├── size        <string-uint64>     <- this is what inspect-keyslot's "Area length" is
+│   ├── encryption  <string>            <- dm-crypt cipher spec, e.g. "aes-xts-plain64"
+│   └── key_size    <int, bytes>        <- area-encryption key size (normally == keyslot key_size)
+└── kdf { }                             <- how your passphrase becomes the area-encryption key
+    ├── type        "argon2i" | "argon2id" | "pbkdf2"
+    ├── salt        <base64>
+    ├── time        <int>               <- argon2 only
+    ├── memory      <int, KB>           <- argon2 only
+    ├── cpus        <int>               <- argon2 only
+    ├── hash        <string>            <- pbkdf2 only
+    └── iterations  <int>               <- pbkdf2 only
+```
+
+Two `key_size` fields exist at different nesting depths (top-level
+`keyslots["N"].key_size` and `keyslots["N"].area.key_size`) — the spec
+describes them as normally equal, but they're formally separate fields:
+one is "the key size stored in keyslot," the other is "the area
+encryption key size." Cross-checked against actual field validation in
+cryptsetup source, `LUKS2_keyslot_validate()` in
+[`lib/luks2/luks2_json_metadata.c`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/main/lib/luks2/luks2_json_metadata.c)
+requires `key_size` (as `json_type_int`) directly on every keyslot
+object, and separately requires the nested `area` object to exist —
+matching the spec's mandatory-fields list above, not just documented
+prose.
+
+### A real example, from the spec itself
+
+This isn't a hand-built illustration — it's the LUKS2 On-Disk Format
+Specification's own worked example (§3.1, full header for an
+AES-XTS-encrypted device with two keyslots), quoted verbatim except for
+re-indentation:
+
+```json
+{
+  "keyslots": {
+    "0": {
+      "type": "luks2",
+      "key_size": 32,
+      "af": {
+        "type": "luks1",
+        "stripes": 4000,
+        "hash": "sha256"
+      },
+      "area": {
+        "type": "raw",
+        "encryption": "aes-xts-plain64",
+        "key_size": 32,
+        "offset": "32768",
+        "size": "131072"
+      },
+      "kdf": {
+        "type": "argon2i",
+        "time": 4,
+        "memory": 235980,
+        "cpus": 2,
+        "salt": "z6vz4xK7cjan92rDA5JF8O6Jk2HouV0O8DMB6GlztVk="
+      }
+    },
+    "1": {
+      "type": "luks2",
+      "key_size": 32,
+      "af": {
+        "type": "luks1",
+        "stripes": 4000,
+        "hash": "sha256"
+      },
+      "area": {
+        "type": "raw",
+        "encryption": "aes-xts-plain64",
+        "key_size": 32,
+        "offset": "163840",
+        "size": "131072"
+      },
+      "kdf": {
+        "type": "pbkdf2",
+        "hash": "sha256",
+        "iterations": 1774240,
+        "salt": "vWcwY3rx2fKpXW2Q6oSCNf8j5bvdJyEzB6BNXECGDsI="
+      }
+    }
+  }
+}
+```
+
+(The full spec example also includes `tokens`, `segments`, `digests`,
+and `config` top-level objects — trimmed here to just `keyslots` since
+that's this document's subject. See
+[`luks2-header-anatomy.md#the-json-metadata-area`](luks2-header-anatomy.md#the-json-metadata-area)
+for the other top-level objects.)
+
+Notice this example's two keyslots use **different KDF types** (slot 0:
+`argon2i`; slot 1: `pbkdf2`) but the **same `key_size`: 32** — this is
+exactly the "different keyslots can use different parameters, but
+happen to share a key length here" case, not evidence that 32 is fixed.
+Change `--cipher` to something in the "doubling applies" rows of the
+table above and both `key_size` fields (top-level and `area.key_size`)
+would read `64` instead, with no other structural change.
 
 Whatever the actual length, the problem AF-splitting solves is the same:
 if that key were written to disk as-is (even encrypted under your
