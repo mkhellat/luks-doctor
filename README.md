@@ -179,6 +179,26 @@ in this repo:
   reasonable time — with clear documentation on the tradeoffs (hardware
   cost, time, and the fact that Argon2id's memory-hardness advantage
   narrows but doesn't vanish against GPU attackers).
+- **Migrate documentation to Texinfo.** The current Markdown docs would
+  become an Info manual (`info luks-doctor`), giving cross-referenced,
+  indexed, offline-browsable documentation in the style of other GNU
+  tooling — fitting for a project already following GNU-style commit
+  conventions. This is a documentation-format migration, not a content
+  rewrite: the existing depth/citations would carry over, restructured
+  for `@node`/`@menu` navigation.
+- **Scope a C or Rust rewrite of the tooling.** `scripts/recover-passphrase`
+  and `scripts/inspect-keyslot` are POSIX `sh` today, which keeps them
+  auditable and dependency-free but means candidate generation is
+  inherently slower than a compiled implementation, which matters as
+  search space grows (edit-distance-2, transposition, dictionary
+  search — all listed above). Scoping work would need to weigh: startup
+  overhead per `cryptsetup open --test-passphrase` call likely dominates
+  actual wall-clock time regardless of language; whether a rewrite
+  should shell out to `cryptsetup` as today or link `libcryptsetup`
+  directly; and whether it's worth the loss of "read the whole script in
+  one sitting" auditability that POSIX `sh` currently provides for a
+  security-sensitive recovery tool. Not started — needs its own
+  scoping/design discussion before any implementation.
 
 If you build one of these, a PR is welcome — please keep new methods in
 their own clearly-labeled script/doc pair rather than folding them into
