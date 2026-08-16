@@ -27,13 +27,29 @@ cryptographically useless) and focuses entirely on *how*.
 
 ## The problem AF-splitting solves, restated concretely
 
-Say your LUKS2 volume's master key is 32 bytes. If that 32-byte key were
-written to disk as-is (even encrypted under your passphrase-derived key),
-an attacker who recovers even a small *fragment* of that region — from
-wear-leveling remnants on an SSD, a bad-block remap, filesystem journal
-residue, whatever — has a fragment of the actual key. Not the whole key,
-but a real, meaningful piece of it, which measurably narrows a brute-force
-search.
+LUKS2 doesn't mandate a single master-key length — it's whatever the
+cipher and key size chosen at `luksFormat` time require, recorded per
+keyslot as `key_size` (in bytes) in the keyslot's own JSON metadata (see
+[`luks2-header-anatomy.md#the-json-metadata-area`](luks2-header-anatomy.md#the-json-metadata-area)).
+`cryptsetup`'s own compiled-in default is `aes-xts-plain64` with a
+256-bit cipher key — but XTS mode needs *two* independent sub-keys, so
+`cryptsetup` automatically doubles that to a 512-bit (64-byte) volume
+key unless you pass `--key-size` explicitly (source:
+[`configure.ac`](https://gitlab.com/cryptsetup/cryptsetup/-/raw/main/configure.ac),
+`luks1-keybits` defaults to 256 and `ENABLE_LUKS_ADJUST_XTS_KEYSIZE` —
+on by default — doubles it for XTS). 32 bytes (256-bit) is a real,
+common value too — it's the exact figure used in the LUKS2 on-disk
+format spec's own worked example — just not a fixed universal constant.
+This document uses 32 bytes purely because it's a familiar round number;
+nothing below depends on that specific length.
+
+Whatever the actual length, the problem AF-splitting solves is the same:
+if that key were written to disk as-is (even encrypted under your
+passphrase-derived key), an attacker who recovers even a small
+*fragment* of that region — from wear-leveling remnants on an SSD, a
+bad-block remap, filesystem journal residue, whatever — has a fragment
+of the actual key. Not the whole key, but a real, meaningful piece of
+it, which measurably narrows a brute-force search.
 
 AF-splitting's job is to take that 32-byte key and expand it into many
 "stripes" (4000, by default) such that:
@@ -227,8 +243,10 @@ all of**, so reconstructing it requires the full ordered set.
 ## A worked example you can trace by hand
 
 Real LUKS2 uses SHA-256 as the diffusion hash and 4000 stripes over a
-256-bit (32-byte) key — utterly infeasible to trace by hand, and that's
-the point (see
+key whose length depends on the cipher chosen at `luksFormat` time
+(commonly 256-bit/32-byte or 512-bit/64-byte — see the previous section)
+— utterly infeasible to trace by hand either way, and that's the point
+(see
 [Mapping the toy example back to real LUKS2](#mapping-the-toy-example-back-to-real-luks2)).
 To actually *see* the algorithm's structure work, this section uses a toy
 version: a 2-byte "key," 3 stripes, and a fake, non-cryptographic stand-in
