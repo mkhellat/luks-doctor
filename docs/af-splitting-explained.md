@@ -125,27 +125,48 @@ being concrete about, since none of them are stated anywhere above:
     reboot/crash) happens, the key is genuinely still resident in
     kernel memory — it does not get wiped just because you stop
     actively reading/writing the volume.
-- **What it's used for, mechanically.** The key gets loaded into the
-  cipher exactly **once**, at unlock time — not re-passed on every read
-  or write. Concretely: when a volume is unlocked, dm-crypt calls
-  `crypt_setkey()`, which calls the kernel crypto API's
-  `crypto_skcipher_setkey(tfm, key, size)` for each pre-allocated cipher
-  object (`tfm`, short for "transform"). That call loads the key into
-  the `tfm` and expands it into the cipher's internal key schedule,
-  which the `tfm` then holds onto internally. From then on, every
-  actual sector encrypt/decrypt — `crypt_convert()` calling
-  `crypt_convert_block_skcipher()`, which runs once per I/O request for
-  as long as the volume stays mounted — just submits work to that
-  already-keyed `tfm`; the key itself is never touched or passed again.
+- **What it's used for, mechanically.** To be precise about which key
+  and what "cipher" means here: this is the same plaintext master key
+  from the first bullet above — already unwrapped from a keyslot and
+  confirmed correct by the digest check below — being put to its actual
+  use. "The cipher" isn't an abstract concept; it's a concrete object
+  the kernel creates. Two separate steps, in order:
+  1. **The cipher object gets created, empty, at unlock time — before
+     the key is involved at all.** When a LUKS device is set up
+     (`luksOpen`), dm-crypt calls `crypt_alloc_tfms_skcipher()`, which
+     calls the kernel crypto API's `crypto_alloc_skcipher("aes-xts-plain64", ...)`
+     (or whatever cipher the volume was formatted with). This asks the
+     kernel to instantiate a real, working implementation of that
+     algorithm — a `struct crypto_skcipher` object, referred to in the
+     code as a `tfm` ("transform") — and the kernel picks a concrete
+     backend for it (a plain C implementation, or a
+     CPU-instruction-accelerated one like AES-NI, depending on what's
+     available; dm-crypt logs which one it picked via
+     `cra_driver_name`). At this point the `tfm` exists and knows *how*
+     to do AES-XTS, but has no key yet.
+  2. **The key gets loaded into that already-existing `tfm`, exactly
+     once, right after.** dm-crypt calls `crypt_setkey()`, which calls
+     `crypto_skcipher_setkey(tfm, key, size)` — this runs AES's real
+     key-schedule-expansion algorithm on the plaintext key and stores
+     the result *inside* the `tfm` object itself. From then on, every
+     actual sector encrypt/decrypt —
+     `crypt_convert()` calling `crypt_convert_block_skcipher()`, which
+     runs once per I/O request for as long as the volume stays mounted —
+     submits work to this already-keyed `tfm`; the plaintext key is not
+     touched or passed again for ordinary reads/writes.
+
   Confirmed directly in
   [`drivers/md/dm-crypt.c`](https://github.com/torvalds/linux/blob/master/drivers/md/dm-crypt.c)
-  (verified 2026-08-17): `crypt_setkey()` loops over `cc->cipher_tfm.tfms[i]`,
-  calling `crypto_skcipher_setkey(cc->cipher_tfm.tfms[i], cc->key + (i *
-  subkey_size), subkey_size)` for each one. The same function runs
-  again if the key is later explicitly changed —
+  (verified 2026-08-17): `crypt_alloc_tfms_skcipher()` populates
+  `cc->cipher_tfm.tfms[i]` via `crypto_alloc_skcipher()`; separately,
+  `crypt_setkey()` loops over those same `cc->cipher_tfm.tfms[i]`
+  objects, calling `crypto_skcipher_setkey(cc->cipher_tfm.tfms[i],
+  cc->key + (i * subkey_size), subkey_size)` for each one. `crypt_setkey()`
+  runs again if the key is later explicitly changed —
   `crypt_wipe_key()` (covered in
   [`cold-boot-and-dma-attacks.md`](cold-boot-and-dma-attacks.md)) calls
-  it too, to load fresh random bytes in place of the real key.
+  it too, loading fresh random bytes into the same, already-existing
+  `tfm` objects in place of the real key.
   `aes-xts-plain64` is cryptsetup's default cipher for this step; that's
   it, there's no other role for this key anywhere in LUKS2.
 - **How LUKS2 knows the unwrap actually worked.** Decrypting a keyslot
