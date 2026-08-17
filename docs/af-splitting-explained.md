@@ -76,9 +76,52 @@ being concrete about, since none of them are stated anywhere above:
   disk, per keyslot, is this key encrypted under your passphrase-derived
   key and then AF-split (the whole subject of this document) — that's
   the `area` region [`checking-for-corruption.md`](checking-for-corruption.md)
-  walks through inspecting. The only place the key exists in cleartext
-  is in kernel memory, briefly, after a correct passphrase unlocks it,
-  for as long as the volume stays mounted.
+  walks through inspecting. In cleartext, it exists in two different
+  places at two different points, each verified against the real
+  source rather than described in general terms:
+  - **Briefly, in `cryptsetup`'s own (userspace) heap memory**, only
+    during the unlock process itself. The unwrapped key is allocated
+    via `crypt_safe_alloc()`
+    ([`lib/utils_safe_memory.c`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/main/lib/utils_safe_memory.c),
+    verified 2026-08-17), which `mlock()`s the allocation (so it can't
+    be swapped to disk) and, on `crypt_safe_free()`, explicitly zeroes
+    it before calling `free()` — not a `memset` that a compiler could
+    optimize away, but `crypt_backend_memzero()`, meant to survive
+    that. This is heap memory, not stack, and not a CPU register — a
+    process with `ptrace` rights on the running `cryptsetup` process
+    (in practice, root, since `luksOpen` itself requires root) could
+    read it while it's live, the same as for any other process's
+    memory; nothing LUKS-specific defends against a *hostile root* on
+    the same machine, only against the key ending up on persistent
+    storage (swap) or lingering after use.
+  - **For as long as the volume stays mapped, inside the Linux
+    kernel's `dm-crypt` target** — a completely separate copy from
+    cryptsetup's, in kernel space rather than userspace. The kernel's
+    `struct crypt_config` (`drivers/md/dm-crypt.c`, confirmed against
+    the current Linux source, commit `8d3ae59288f1e7d58d76558a6ee96d533bc5019f`)
+    ends with `u8 key[] __counted_by(key_size);` — the raw key bytes
+    are allocated as part of this struct itself (`kzalloc_flex(*cc,
+    key, key_size)`), on the kernel heap, not the stack. It stays
+    there for the mapping's entire lifetime — this is *why* a mounted
+    LUKS volume keeps working without re-prompting for a passphrase on
+    every read/write: the kernel already has the key and uses it
+    directly, it doesn't ask userspace again. Reading kernel memory
+    from userspace isn't possible through ordinary means (no
+    `ptrace`-equivalent for kernel memory); it requires either a kernel
+    exploit, physical access with a hardware/DMA-based memory-dump
+    attack (a real, known LUKS/dm-crypt threat class, sometimes called
+    a "cold boot" or DMA attack — out of scope for what this document
+    covers), or root abusing something like `/dev/kmem` where that's
+    even enabled (it's disabled by default on modern kernels). On
+    `cryptsetup luksClose` (which tears down the device-mapper
+    target), the kernel's own destructor, `crypt_dtr()`, explicitly
+    zeroes `struct crypt_config` before freeing it — the source
+    literally comments this step `/* Must zero key material before
+    freeing */` before calling `kfree_sensitive(cc)`, which zeroes
+    memory before the underlying `kfree()`. Until `luksClose` (or a
+    reboot/crash) happens, the key is genuinely still resident in
+    kernel memory — it does not get wiped just because you stop
+    actively reading/writing the volume.
 - **What it's used for, mechanically.** Once unlocked, dm-crypt hands
   this key straight to the block cipher — `aes-xts-plain64` by
   cryptsetup's default — which uses it to encrypt outgoing sectors and
