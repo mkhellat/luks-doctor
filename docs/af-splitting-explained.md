@@ -143,15 +143,17 @@ being concrete about, since none of them are stated anywhere above:
      available; dm-crypt logs which one it picked via
      `cra_driver_name`). At this point the `tfm` exists and knows *how*
      to do AES-XTS, but has no key yet.
-  2. **The key gets loaded into that already-existing `tfm`, exactly
-     once, right after.** dm-crypt calls `crypt_setkey()`, which calls
+  2. **The key gets loaded into that already-existing `tfm` a single
+     time, right after — not repeated for every read or write.**
+     dm-crypt calls `crypt_setkey()`, which calls
      `crypto_skcipher_setkey(tfm, key, size)` — this runs AES's real
      key-schedule-expansion algorithm on the plaintext key and stores
-     the result *inside* the `tfm` object itself. From then on, every
-     actual sector encrypt/decrypt —
-     `crypt_convert()` calling `crypt_convert_block_skcipher()`, which
-     runs once per I/O request for as long as the volume stays mounted —
-     submits work to this already-keyed `tfm`; the plaintext key is not
+     the result *inside* the `tfm` object itself. That single call is
+     the *only* time the plaintext key is involved. Every actual sector
+     encrypt/decrypt after that — `crypt_convert()` calling
+     `crypt_convert_block_skcipher()`, invoked separately for each I/O
+     request for as long as the volume stays mounted — submits work to
+     this already-keyed `tfm` without the plaintext key itself being
      touched or passed again for ordinary reads/writes.
 
   Confirmed directly in
