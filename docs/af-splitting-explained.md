@@ -110,8 +110,11 @@ being concrete about, since none of them are stated anywhere above:
     `ptrace`-equivalent for kernel memory); it requires either a kernel
     exploit, physical access with a hardware/DMA-based memory-dump
     attack (a real, known LUKS/dm-crypt threat class, sometimes called
-    a "cold boot" or DMA attack — out of scope for what this document
-    covers), or root abusing something like `/dev/kmem` where that's
+    a "cold boot" or DMA attack — a fundamentally different threat
+    model from anything else in this project, since it requires an
+    already-unlocked, running machine rather than a disconnected drive;
+    see [`cold-boot-and-dma-attacks.md`](cold-boot-and-dma-attacks.md)
+    for the full treatment), or root abusing something like `/dev/kmem` where that's
     even enabled (it's disabled by default on modern kernels). On
     `cryptsetup luksClose` (which tears down the device-mapper
     target), the kernel's own destructor, `crypt_dtr()`, explicitly

@@ -106,6 +106,12 @@ and secondary headers legitimately differ — is in
 - [`docs/passphrase-recovery.md`](docs/passphrase-recovery.md) — the
   edit-distance-1 methodology in detail, why it's safe, and its
   explicit limits.
+- [`docs/cold-boot-and-dma-attacks.md`](docs/cold-boot-and-dma-attacks.md) —
+  a deliberately separate threat model: attacking the cleartext master
+  key while it's resident in memory on an already-unlocked, running
+  machine, covering the real cold-boot/DMA research and which
+  mitigations (`luksSuspend`, IOMMU, UEFI reset-attack mitigation) do
+  and don't actually help.
 - [`docs/entropy-analysis.md`](docs/entropy-analysis.md) — quantitative
   chi-squared/entropy/NIST-SP-800-22 analysis of keyslot data: what
   statistical testing can and provably cannot detect about corruption,
