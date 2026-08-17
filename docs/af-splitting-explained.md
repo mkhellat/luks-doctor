@@ -125,12 +125,11 @@ being concrete about, since none of them are stated anywhere above:
     reboot/crash) happens, the key is genuinely still resident in
     kernel memory — it does not get wiped just because you stop
     actively reading/writing the volume.
-- **What it's used for, mechanically.** To be precise about which key
-  and what "cipher" means here: this is the same plaintext master key
-  from the first bullet above — already unwrapped from a keyslot and
-  confirmed correct by the digest check below — being put to its actual
-  use. "The cipher" isn't an abstract concept; it's a concrete object
-  the kernel creates. Two separate steps, in order:
+- **What it's used for, mechanically.** This is the same plaintext
+  master key from the first bullet above — already unwrapped from a
+  keyslot and confirmed correct by the digest check below — being put
+  to its actual use: encrypting and decrypting sectors. That happens
+  inside a concrete kernel object, created in two separate steps:
   1. **The cipher object gets created, empty, at unlock time — before
      the key is involved at all.** When a LUKS device is set up
      (`luksOpen`), dm-crypt calls `crypt_alloc_tfms_skcipher()`, which
