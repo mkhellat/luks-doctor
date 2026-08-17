@@ -173,7 +173,7 @@ Offset (hex/dec)   Field         Size (B)  Purpose
                    TOTAL             4096
 ```
 
-Two fields carry the most operational weight for diagnosis:
+Three fields carry the most operational weight for diagnosis:
 
 - **`hdr_size`** — tells you exactly where the JSON area ends and,
   therefore, where the secondary header must begin. If a tool's assumed
@@ -185,6 +185,28 @@ Two fields carry the most operational weight for diagnosis:
   checksum is otherwise internally consistent — this is a deliberate
   guard against partition-table manipulation, not a corruption case
   `cryptsetup repair` can silently paper over.
+- **`csum`** — how, precisely, per code: `cryptsetup` reads the 4096-byte
+  binary header plus the whole JSON area, zeroes out the 64-byte `csum`
+  field in its own in-memory copy (`csum` obviously can't include itself
+  in the hash it stores), hashes the rest with `csum_alg` (SHA-256 by
+  default), and compares the result against the `csum` value actually
+  read from disk with `memcmp` — confirmed directly in
+  `hdr_checksum_calculate()`/`hdr_checksum_check()`
+  ([`lib/luks2/luks2_disk_metadata.c`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/main/lib/luks2/luks2_disk_metadata.c),
+  verified 2026-08-17). This is a plain integrity checksum, not a
+  KDF-based verification like the master-key `digests` check (see
+  [`af-splitting-explained.md`](af-splitting-explained.md#aside-where-does-that-key-length-number-actually-come-from)) —
+  it only proves the header + JSON bytes weren't altered or corrupted in
+  transit/at rest, nothing about any passphrase. A checksum mismatch
+  doesn't cause a hard failure by itself: `LUKS2_disk_hdr_read()` reads
+  primary and secondary headers independently, marks either one that
+  fails its own checksum as unusable, and falls back to whichever copy
+  (if any) passed — `seqid` (the field above `label`) only comes into
+  play as a tiebreaker when *both* copies pass their checksum but
+  disagree, picking the higher (more recent) sequence number. This is
+  exactly the fallback `cryptsetup repair` exploits to resync a damaged
+  primary header from a good secondary — see
+  [`checking-for-corruption.md`](checking-for-corruption.md#when-to-run-cryptsetup-repair-and-what-it-cant-fix).
 
 Per the spec, only the first 512 bytes of this 4096-byte struct are
 actually populated — the trailing `padding4096` exists purely so the
