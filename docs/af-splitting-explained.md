@@ -69,7 +69,7 @@ being concrete about, since none of them are stated anywhere above:
   derived from your passphrase — it's generated once, from random
   bytes, at `luksFormat` time, and never changes for the life of the
   volume (unless you re-encrypt). Your passphrase's only job is to
-  unlock (decrypt) a *copy* of this key stored in a keyslot — see
+  unwrap (decrypt) a *copy* of this key stored in a keyslot — see
   [`luks2-header-anatomy.md`](luks2-header-anatomy.md) for the full
   unlock flow.
 - **Where it lives.** Never in cleartext on disk, anywhere. What's on
@@ -84,6 +84,25 @@ being concrete about, since none of them are stated anywhere above:
   cryptsetup's default — which uses it to encrypt outgoing sectors and
   decrypt incoming ones. That's it; there's no other role for this key
   anywhere in LUKS2.
+- **How LUKS2 knows the unwrap actually worked.** Decrypting a keyslot
+  with the *wrong* passphrase doesn't fail loudly — symmetric
+  decryption with the wrong key just produces wrong-looking bytes, not
+  an error. So unwrapping alone can't tell you whether you got the real
+  key back. LUKS2 solves this with a separate check: at `luksFormat`
+  time, the real master key is run through PBKDF2 once (independently
+  of the passphrase KDF) with a stored salt, and the result is saved in
+  cleartext as a `digest` in the header's JSON metadata. After
+  unwrapping a candidate key from any keyslot, cryptsetup repeats that
+  same PBKDF2 computation on the candidate and compares it, byte for
+  byte, against the stored digest — confirmed directly in
+  `PBKDF2_digest_verify()`
+  ([`lib/luks2/luks2_digest_pbkdf2.c`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/main/lib/luks2/luks2_digest_pbkdf2.c),
+  verified 2026-08-17). Match means the passphrase was right; mismatch
+  means it wasn't — and this check happens *before* cryptsetup ever
+  touches your actual encrypted data, which is exactly what
+  `cryptsetup open --test-passphrase` relies on to verify a guess
+  safely without mounting anything (see
+  [`passphrase-recovery.md`](passphrase-recovery.md)).
 
 With that grounded, the actual question this aside answers: **why is
 this key 512 bits by default**, when "AES-256" (256 bits) is the number
