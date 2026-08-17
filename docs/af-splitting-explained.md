@@ -120,20 +120,27 @@ with no `--key-size` needs 512 bits total specifically because a
 independent — there's no smaller "real" master key underneath that gets
 inflated; the 512-bit value *is* the pair.
 
-cryptsetup encodes this as a doubling rule relative to a *different*
-cipher's expectation, because its internal default-size constant
-(`default_size_bits`) is shared across cipher families and represents
-"AES-256, single key" — the natural default for non-XTS modes like
-`aes-cbc-essiv:sha256`, which only ever need one key. For XTS
-specifically, that shared 256-bit constant is doubled to 512 bits so
-the result is still "AES-256, but XTS's two-key shape" rather than
-silently downgrading XTS to two AES-128 keys. See
-[Where key length actually comes from, per code](#where-key-length-actually-comes-from-per-code)
-for the exact code path. 32 bytes (256-bit) is a real, common value too
-— it's the exact figure used in the LUKS2 on-disk format spec's own
-worked example, for a *single*-key mode — just not a fixed universal
-constant. This document uses 32 bytes purely because it's a familiar
-round number; nothing below depends on that specific length.
+cryptsetup only has *one* compiled-in default key size, 256 bits, meant
+for ordinary single-key modes like `aes-cbc-essiv:sha256`. It reuses
+that same 256-bit number as the starting point for XTS too, rather than
+maintaining a second default — but a single 256-bit value can't supply
+*two* independent 256-bit keys, so the code takes that one shared
+256-bit constant and multiplies it by two specifically when the cipher
+mode is XTS, arriving at 512 bits before generating the key.
+cryptsetup's build configuration names this behavior directly —
+`configure.ac`'s `--disable-luks-adjust-xts-keysize` option and its
+`ENABLE_LUKS_ADJUST_XTS_KEYSIZE` macro are both documented in the
+source as *"XTS mode requires two keys, double default LUKS keysize if
+needed"* — worth flagging up front so the exact code doing this
+arithmetic, shown next
+([Where key length actually comes from, per code](#where-key-length-actually-comes-from-per-code)),
+doesn't read like a 256-bit key gets padded out after the fact; it
+isn't, per the explanation above — the multiplication happens *before*
+any key material is generated. 32 bytes (256-bit) is a real, common
+value too — it's the exact figure used in the LUKS2 on-disk format
+spec's own worked example, for a *single*-key mode — just not a fixed
+universal constant. This document uses 32 bytes purely because it's a
+familiar round number; nothing below depends on that specific length.
 
 #### Where key length actually comes from, per code
 
