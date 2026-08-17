@@ -77,13 +77,25 @@ generations, against a *fixed* iteration count — real, observed drift
 in what a captured LUKS1 header costs to attack over time, not a
 theoretical extrapolation. At the RTX 3090 rate alone, 28,356
 guesses/sec sustained for a day is roughly 2.45 billion full-passphrase
-attempts. (These numbers are guesses/sec at hashcat's specific
-163,044-iteration benchmark point — a real captured header's actual
-attack cost scales inversely with whatever iteration count *that*
-header stores, which varies by hardware and `--iter-time` at the time
-it was created; this document does not have a citable, independently
-re-verified figure for the real-world distribution of that number
-across deployed volumes, so no such range is claimed here.)
+attempts. These numbers are guesses/sec at hashcat's specific
+163,044-iteration benchmark point, chosen for cross-tool comparability
+— a real captured header's actual attack cost scales inversely with
+whatever iteration count *that* header stores.
+
+**One real, independently verifiable data point for a captured
+header's actual iteration count** (not a general distribution — this
+project makes no claim about the range across deployed volumes, only
+cites one concrete, checkable example): a user-submitted LUKS1 header
+in a public hashcat bug report shows `MK iterations: 27250` (the
+master-key-digest PBKDF2 round count) and, for its one enabled keyslot,
+`Iterations: 109010` (the separate, keyslot-specific PBKDF2 round
+count that actually gates a passphrase guess) —
+<https://github.com/hashcat/hashcat/issues/1729>, `cryptsetup luksDump`
+output quoted verbatim in the issue. At the RTX 3090 rate above scaled
+down proportionally (163,044 / 109,010 ≈ 1.5x fewer rounds per guess
+than the benchmark point), that header would cost roughly 42,400
+guesses/sec on a single RTX 3090 — illustrative arithmetic only, not a
+verified independent benchmark at that exact iteration count.
 
 ## Argon2id (LUKS2 default), precisely
 
