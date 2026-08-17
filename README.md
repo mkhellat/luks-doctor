@@ -106,6 +106,13 @@ and secondary headers legitimately differ — is in
 - [`docs/passphrase-recovery.md`](docs/passphrase-recovery.md) — the
   edit-distance-1 methodology in detail, why it's safe, and its
   explicit limits.
+- [`docs/entropy-analysis.md`](docs/entropy-analysis.md) — quantitative
+  chi-squared/entropy/NIST-SP-800-22 analysis of keyslot data: what
+  statistical testing can and provably cannot detect about corruption,
+  backed by real experiments against real AF-split output.
+- [`docs/kdf-comparison.md`](docs/kdf-comparison.md) — Argon2id vs.
+  PBKDF2 grounded in the actual specs, cryptsetup's source, and real
+  published GPU cracking-speed benchmarks.
 
 ## Usage
 
@@ -208,13 +215,12 @@ simple and the more speculative/expensive methods stay clearly opt-in.
 ### Research milestones (pre-roadmap)
 
 These two are deeper and more open-ended than the extensions above —
-research/analysis work, not scoped features yet. The intent is for
-their findings to *inform* future roadmap items (e.g. a
-statistically-grounded corruption heuristic to replace or supplement
-`inspect-keyslot`'s current zero-run/pattern-repeat checks, or
-KDF-choice guidance grounded in an actual security comparison rather
-than "argon2id is generally recommended"), not to be implemented
-directly:
+research/analysis work, not scoped features. Both are now written up
+in full; the intent is for their findings to *inform* future roadmap
+items (e.g. a statistically-grounded corruption heuristic to replace or
+supplement `inspect-keyslot`'s current zero-run/pattern-repeat checks,
+or KDF-choice guidance grounded in an actual security comparison), not
+that either doc is itself a scoped feature to implement directly:
 
 - **Entropy/noise analysis of encrypted segments, done quantitatively.**
   `inspect-keyslot`'s current heuristics (see
@@ -222,13 +228,12 @@ directly:
   are visual/structural — zero-run length, repeating-pattern detection
   — explicitly *not* a statistical measure, and explicitly incapable of
   catching single-bit-flip corruption (diffusion makes that
-  information-theoretically invisible, not just hard to detect). A
-  proper deep-dive into entropy/noise/randomness-deficit calculation
-  (chi-squared, NIST SP 800-22 style statistical test suites, or
-  similar) against real AF-striped keyslot data and encrypted data
-  segments, to establish what such analysis *can* and *definitively
-  cannot* detect, replacing "eyeball the hex dump" with actual
-  measurement where measurement is possible.
+  information-theoretically invisible, not just hard to detect).
+  **Done**: see [`docs/entropy-analysis.md`](docs/entropy-analysis.md)
+  for the deep-dive into entropy/randomness-deficit calculation
+  (chi-squared, NIST SP 800-22, Shannon entropy) against real
+  AF-striped keyslot data, establishing precisely what such analysis
+  *can* and *definitively cannot* detect.
 - **Argon2id vs. PBKDF2 comparison, LUKS1 vs. LUKS2, done
   cryptographically.** A rigorous comparison — memory-hardness
   properties, GPU/ASIC attack cost modeling, actual information
@@ -236,7 +241,8 @@ directly:
   (iteration count, memory cost, salt) — grounding LUKS1-vs-LUKS2 KDF
   discussion in real cryptanalysis and the relevant math rather than
   the generic "Argon2id is memory-hard, PBKDF2 isn't" summary this
-  project's docs currently rely on.
+  project's docs otherwise rely on. **Done**: see
+  [`docs/kdf-comparison.md`](docs/kdf-comparison.md).
 
 ## Contributing
 
