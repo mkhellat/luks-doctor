@@ -60,21 +60,45 @@ the kind of imprecision this project's docs are supposed to avoid.
 
 ### Aside: where does that key-length number actually come from?
 
-LUKS2 doesn't mandate a single master-key length — it's whatever the
-cipher and key size chosen at `luksFormat` time require, recorded per
-keyslot as `key_size` (in bytes) in the keyslot's own JSON metadata (see
-[`luks2-header-anatomy.md#the-json-metadata-area`](luks2-header-anatomy.md#the-json-metadata-area)).
-`cryptsetup`'s own compiled-in default cipher is `aes-xts-plain64`,
-which needs a 512-bit (64-byte) volume key by construction — not
-because cryptsetup pads or doubles a smaller key, but because an
-XTS-mode key *is* two independent, equal-length AES keys concatenated
-end to end (`key1 || key2`; each half is a full, separate AES-256 key
-here, not half an AES-256 key). One half encrypts the actual data
-block; the other half encrypts a per-sector "tweak" value that gets
-mixed in before and after the main encryption (the XEX construction —
-XOR-Encrypt-XOR). Confirmed directly in the Linux kernel's XTS
-implementation, which is what dm-crypt (and therefore LUKS2) actually
-calls at unlock time:
+Before getting into *why* the number is what it is, three things worth
+being concrete about, since none of them are stated anywhere above:
+
+- **What this key actually is.** It's the one secret dm-crypt uses to
+  encrypt and decrypt your actual filesystem data, sector by sector,
+  every time you read or write to the unlocked volume. It is *not*
+  derived from your passphrase — it's generated once, from random
+  bytes, at `luksFormat` time, and never changes for the life of the
+  volume (unless you re-encrypt). Your passphrase's only job is to
+  unlock (decrypt) a *copy* of this key stored in a keyslot — see
+  [`luks2-header-anatomy.md`](luks2-header-anatomy.md) for the full
+  unlock flow.
+- **Where it lives.** Never in cleartext on disk, anywhere. What's on
+  disk, per keyslot, is this key encrypted under your passphrase-derived
+  key and then AF-split (the whole subject of this document) — that's
+  the `area` region [`checking-for-corruption.md`](checking-for-corruption.md)
+  walks through inspecting. The only place the key exists in cleartext
+  is in kernel memory, briefly, after a correct passphrase unlocks it,
+  for as long as the volume stays mounted.
+- **What it's used for, mechanically.** Once unlocked, dm-crypt hands
+  this key straight to the block cipher — `aes-xts-plain64` by
+  cryptsetup's default — which uses it to encrypt outgoing sectors and
+  decrypt incoming ones. That's it; there's no other role for this key
+  anywhere in LUKS2.
+
+With that grounded, the actual question this aside answers: **why is
+this key 512 bits by default**, when "AES-256" (256 bits) is the number
+most people would guess? Short answer: `aes-xts-plain64`'s "XTS" part
+needs two separate 256-bit AES keys, not one — one key encrypts your
+actual data, the other encrypts a small per-sector value (a "tweak")
+that keeps two sectors holding identical plaintext from producing
+identical ciphertext. Both keys are required and independent; there is
+no single, smaller "real" key underneath that gets padded or doubled
+after the fact — the 512-bit value *is* the two keys, concatenated.
+
+That two-key requirement is confirmed directly in the Linux kernel code
+dm-crypt actually calls at unlock time (`crypto/xts.c`,
+`xts_setkey()`), which splits an incoming key exactly in half and
+explicitly rejects it if the two halves are equal:
 
 ```c
 static int xts_setkey(struct crypto_skcipher *parent, const u8 *key,
@@ -92,65 +116,50 @@ static int xts_setkey(struct crypto_skcipher *parent, const u8 *key,
 	 * to encrypt the data */
 	...
 ```
-(`crypto/xts.c`, `xts_setkey()`, Linux kernel source —
-[`crypto/xts.c` on kernel.org's git mirror](https://github.com/torvalds/linux/blob/master/crypto/xts.c),
-verified 2026-08-16; `xts_verify_key()`, called just above, actively
-*rejects* a key whose two halves are equal — using the same key twice
-is a real, documented weakness in XTS, not just wasteful. NIST SP
-800-38E itself doesn't discuss this (it only has a bibliography
-appendix, no security-rationale annex); the actual requirement and its
-justification live in
-[FIPS 140-2 Implementation Guidance, §A.9 "XTS-AES Key Generation
+([`crypto/xts.c` on kernel.org's git mirror](https://github.com/torvalds/linux/blob/master/crypto/xts.c),
+verified 2026-08-16.) That rejection isn't defensive paranoia — using
+the same key for both halves is a real, documented, exploitable
+weakness (a chosen-ciphertext attack letting an adversary tamper with
+plaintext without knowing the key), specified in [FIPS 140-2
+Implementation Guidance, §A.9 "XTS-AES Key Generation
 Requirements"](https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Module-Validation-Program/documents/fips140-2/FIPS1402IG.pdf)
-(p. 213; renumbered to §C.I under the newer [FIPS 140-3
+(p. 213; §C.I in the newer [FIPS 140-3
 IG](https://csrc.nist.gov/csrc/media/Projects/cryptographic-module-validation-program/documents/fips%20140-3/FIPS%20140-3%20IG.pdf),
-p. 141) — verbatim: *"An implementation of XTS-AES that improperly
-generates Key so that Key_1 = Key_2 is vulnerable to a chosen
-ciphertext attack... by obtaining the decryption of only one chosen
-ciphertext block in a given data sector, an adversary who does not
-know the key may be able to manipulate the ciphertext in that sector so
-that one or more plaintext blocks change to any desired value... The
-module shall check explicitly that Key_1 ≠ Key_2."* That IG cites the
-underlying attack to Rogaway, *Efficient Instantiations of Tweakable
-Blockciphers and Refinements to Modes OCB and PMAC* (2004), §6, and to
-IEEE Std 1619-2007 Annex D §D.4.3 (pp. 31–32) for why XTS-AES departs
-from the generic XEX construction on this point. So `--cipher aes-xts-plain64`
-with no `--key-size` needs 512 bits total specifically because a
-256-bit *tweak* key and a 256-bit *data* key both have to exist and be
-independent — there's no smaller "real" master key underneath that gets
-inflated; the 512-bit value *is* the pair.
+p. 141), citing Rogaway's *Efficient Instantiations of Tweakable
+Blockciphers and Refinements to Modes OCB and PMAC* (2004), §6.
+(NIST SP 800-38E, sometimes cited for this, actually has no
+security-rationale section on it — just a bibliography — so the FIPS IG
+is the real source, not that spec.)
 
-cryptsetup only has *one* compiled-in default key size, 256 bits, meant
-for ordinary single-key modes like `aes-cbc-essiv:sha256`. It reuses
-that same 256-bit number as the starting point for XTS too, rather than
-maintaining a second default — but a single 256-bit value can't supply
-*two* independent 256-bit keys, so the code takes that one shared
-256-bit constant and multiplies it by two specifically when the cipher
-mode is XTS, arriving at 512 bits before generating the key.
-cryptsetup's build configuration names this behavior directly —
+**Why cryptsetup's own code describes this as "doubling."** cryptsetup
+has exactly one compiled-in default key size, 256 bits, meant for
+ordinary single-key ciphers like `aes-cbc-essiv:sha256`. Rather than
+maintaining a second default for XTS, it reuses that same 256-bit
+number and multiplies it by two specifically when the chosen cipher
+mode is XTS — arriving at 512 bits before any key material is
+generated. cryptsetup's build configuration names this literally:
 `configure.ac`'s `--disable-luks-adjust-xts-keysize` option and its
 `ENABLE_LUKS_ADJUST_XTS_KEYSIZE` macro are both documented in the
 source as *"XTS mode requires two keys, double default LUKS keysize if
-needed"* — worth flagging up front so the exact code doing this
-arithmetic, shown next
-([Where key length actually comes from, per code](#where-key-length-actually-comes-from-per-code)),
-doesn't read like a 256-bit key gets padded out after the fact; it
-isn't, per the explanation above — the multiplication happens *before*
-any key material is generated. 32 bytes (256-bit) is a real, common
-value too — it's the exact figure used in the LUKS2 on-disk format
-spec's own worked example, for a *single*-key mode — just not a fixed
-universal constant. This document uses 32 bytes purely because it's a
-familiar round number; nothing below depends on that specific length.
+needed."* The exact code doing this arithmetic is in the next section
+([Where key length actually comes from, per code](#where-key-length-actually-comes-from-per-code)) —
+flagging the word "doubling" here so it's read correctly: it's
+cryptsetup's default-selection *code* doubling a shared constant, not a
+smaller 256-bit key getting padded out into 512 bits after generation.
+
+None of this is a fixed rule, though — it's just cryptsetup's default
+when you don't pass `--key-size`. 32 bytes (256-bit, a single key, no
+doubling) is also a real, common value — it's the exact figure the
+LUKS2 spec's own worked example uses, for a cipher mode that only needs
+one key. This document uses 32 bytes for its worked example purely
+because it's a familiar round number; nothing below depends on that
+specific length.
 
 #### Where key length actually comes from, per code
 
 There are three separate layers here, and conflating them produces
 exactly the kind of "32 bytes is standard" overstatement this section
-just corrected. (Layer 3 below talks about cryptsetup "doubling" a
-256-bit default to 512 bits for XTS — that's describing the code's own
-arithmetic, not implying a smaller 256-bit key gets padded; per the
-explanation above, the 512-bit result is two full, independent 256-bit
-keys from the start.) Each layer's actual behavior, cited directly:
+just corrected. Each layer's actual behavior, cited directly:
 
 1. **LUKS2 on-disk format**: imposes no fixed key length. Each keyslot's
    JSON metadata carries its own `key_size` (bytes) field, and different
