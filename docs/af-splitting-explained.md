@@ -125,11 +125,29 @@ being concrete about, since none of them are stated anywhere above:
     reboot/crash) happens, the key is genuinely still resident in
     kernel memory — it does not get wiped just because you stop
     actively reading/writing the volume.
-- **What it's used for, mechanically.** Once unlocked, dm-crypt hands
-  this key straight to the block cipher — `aes-xts-plain64` by
-  cryptsetup's default — which uses it to encrypt outgoing sectors and
-  decrypt incoming ones. That's it; there's no other role for this key
-  anywhere in LUKS2.
+- **What it's used for, mechanically.** "Hands over" precisely means:
+  once at unlock time (not per sector, not repeatedly), dm-crypt calls
+  `crypt_setkey()`, which calls the kernel crypto API's
+  `crypto_skcipher_setkey(tfm, key, size)` — this loads the key into a
+  pre-allocated `crypto_skcipher` transform object (`tfm`) and expands
+  it into that cipher's internal key schedule, stored inside the `tfm`
+  itself. Confirmed directly in
+  [`drivers/md/dm-crypt.c`](https://github.com/torvalds/linux/blob/master/drivers/md/dm-crypt.c)
+  (verified 2026-08-17): `crypt_setkey()` loops over
+  `cc->cipher_tfm.tfms[i]`, calling `crypto_skcipher_setkey(cc->cipher_tfm.tfms[i],
+  cc->key + (i * subkey_size), subkey_size)` for each one — this is the
+  one-time step that runs when a volume is unlocked (`luksOpen`) or its
+  key is later explicitly changed (`crypt_wipe_key()`, covered in
+  [`cold-boot-and-dma-attacks.md`](cold-boot-and-dma-attacks.md), calls
+  the same function). After that, every actual sector encrypt/decrypt —
+  `crypt_convert()` → `crypt_convert_block_skcipher()`, called once per
+  I/O request for as long as the volume stays mounted — submits work to
+  that *already-keyed* `tfm` without touching or re-passing the key
+  again. So the key genuinely is only "handed over" once per unlock,
+  not on every read/write — what happens on every read/write is the
+  cipher (already holding the key internally) processing sectors.
+  `aes-xts-plain64` is cryptsetup's default cipher for this step; that's
+  it, there's no other role for this key anywhere in LUKS2.
 - **How LUKS2 knows the unwrap actually worked.** Decrypting a keyslot
   with the *wrong* passphrase doesn't fail loudly — symmetric
   decryption with the wrong key just produces wrong-looking bytes, not
