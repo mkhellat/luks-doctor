@@ -150,10 +150,15 @@ being concrete about, since none of them are stated anywhere above:
      — turning them into a *key schedule* stored inside the `tfm`.** A
      key schedule is AES's own internal expansion of your key into a
      separate round key for each of its encryption rounds (14 rounds
-     for AES-256, so 15 round keys) — see FIPS-197's `KeyExpansion`
-     algorithm; in the kernel this is `crypto_aes_expand_key()`
-     (`crypto/aes_generic.c`), which the `tfm`'s `setkey` operation
-     calls internally. dm-crypt triggers this by calling
+     for AES-256, so 15 round keys) — this is `KeyExpansion()`, [FIPS
+     197](https://doi.org/10.6028/NIST.FIPS.197-upd1) §5.2, p. 17
+     (Algorithm 2). In the current kernel this is `aes_expandkey()`
+     (declared in
+     [`include/crypto/aes.h`](https://github.com/torvalds/linux/blob/d4e273a5065f81ca86eca48cb3fed55867cc0115/include/crypto/aes.h#L146-L160),
+     pinned commit `d4e273a5`, verified 2026-08-20; its own doc comment
+     says outright: *"Expands the AES key as described in FIPS-197"*),
+     which the `tfm`'s `setkey` operation calls internally. dm-crypt
+     triggers this by calling
      `crypt_setkey()`, which calls
      `crypto_skcipher_setkey(tfm, key, size)`. This is the only point
      in the entire volume-mount lifetime where the raw plaintext key
@@ -177,23 +182,31 @@ being concrete about, since none of them are stated anywhere above:
      half of it.
 
   Confirmed directly in
-  [`drivers/md/dm-crypt.c`](https://github.com/torvalds/linux/blob/master/drivers/md/dm-crypt.c)
-  (verified 2026-08-20 against current `master`): step 1's
-  `crypt_alloc_tfms_skcipher()` populates `cc->cipher_tfm.tfms[i]` via
-  `crypto_alloc_skcipher()`. Step 2's `crypt_setkey()` loops over those
-  same `tfms[i]` objects, calling `crypto_skcipher_setkey(cc->cipher_tfm.tfms[i],
-  cc->key + (i * subkey_size), subkey_size)` for each one — and this
-  exact call is the *only* call to `crypto_skcipher_setkey()` in the
-  entire file, confirming it's genuinely a one-time step per unlock,
-  not something the per-sector path also does. Step 3 is a completely
-  separate code path: `crypt_alloc_req_skcipher()` calls
-  `skcipher_request_set_tfm(ctx->r.req, cc->cipher_tfm.tfms[key_index])`,
-  and `crypt_convert_block_skcipher()` then calls
-  `crypto_skcipher_encrypt()`/`crypto_skcipher_decrypt()` — both run
-  fresh for every sector, and neither one calls
+  [`drivers/md/dm-crypt.c`, pinned commit `43fd83c0`](https://github.com/torvalds/linux/blob/43fd83c0b1dc127cf13b4c05303665924e63ef94/drivers/md/dm-crypt.c)
+  (verified 2026-08-20): step 1's
+  [`crypt_alloc_tfms_skcipher()`](https://github.com/torvalds/linux/blob/43fd83c0b1dc127cf13b4c05303665924e63ef94/drivers/md/dm-crypt.c#L2297)
+  (line 2297) populates `cc->cipher_tfm.tfms[i]` via
+  `crypto_alloc_skcipher()`. Step 2's
+  [`crypt_setkey()`](https://github.com/torvalds/linux/blob/43fd83c0b1dc127cf13b4c05303665924e63ef94/drivers/md/dm-crypt.c#L2388-L2414)
+  (lines 2388–2414) loops over those same `tfms[i]` objects, calling
+  `crypto_skcipher_setkey(cc->cipher_tfm.tfms[i], cc->key + (i *
+  subkey_size), subkey_size)` (line 2414) for each one — and this exact
+  call is the *only* call to `crypto_skcipher_setkey()` in the entire
+  file, confirming it's genuinely a one-time step per unlock, not
+  something the per-sector path also does. Step 3 is a completely
+  separate code path:
+  [`crypt_alloc_req_skcipher()`](https://github.com/torvalds/linux/blob/43fd83c0b1dc127cf13b4c05303665924e63ef94/drivers/md/dm-crypt.c#L1431-L1442)
+  (lines 1431–1442) calls
+  `skcipher_request_set_tfm(ctx->r.req, cc->cipher_tfm.tfms[key_index])`
+  (line 1442), and
+  [`crypt_convert_block_skcipher()`](https://github.com/torvalds/linux/blob/43fd83c0b1dc127cf13b4c05303665924e63ef94/drivers/md/dm-crypt.c#L1352-L1418)
+  (lines 1352–1418) then calls
+  `crypto_skcipher_encrypt()`/`crypto_skcipher_decrypt()` (lines
+  1416/1418) — both run fresh for every sector, and neither one calls
   `crypto_skcipher_setkey()`. (`crypto_skcipher_encrypt()` also appears
-  once more, in a self-test helper used to validate a cipher choice
-  before committing to it — unrelated to the per-sector I/O path.)
+  once more, at line 754, inside a self-test helper used to validate a
+  cipher choice before committing to it — unrelated to the per-sector
+  I/O path.)
   `crypt_setkey()` does run again later, but only if the key is
   explicitly replaced: `crypt_wipe_key()` (covered in
   [`cold-boot-and-dma-attacks.md`](cold-boot-and-dma-attacks.md)) calls
