@@ -162,9 +162,31 @@ being concrete about, since none of them are stated anywhere above:
      `crypt_setkey()`, which calls
      `crypto_skcipher_setkey(tfm, key, size)`. This is the only point
      in the entire volume-mount lifetime where the raw plaintext key
-     bytes are handed to anything; after this call returns, the
-     expanded schedule is what's stored inside the `tfm`, and the raw
-     key bytes are never referenced again for ordinary I/O.
+     bytes are handed to a *new* function call for ordinary I/O — but
+     that doesn't mean the raw bytes disappear afterward. The schedule
+     produced isn't some separate, derived secret that replaces the
+     key; per FIPS 197 Algorithm 2 (quoted above), the schedule's first
+     `Nk` words *are* the raw key, verbatim (`w[0..Nk-1] = key`), with
+     the remaining round keys computed from there. Concretely, the
+     kernel's `struct crypto_aes_ctx`
+     ([`include/crypto/aes.h`](https://github.com/torvalds/linux/blob/d4e273a5065f81ca86eca48cb3fed55867cc0115/include/crypto/aes.h#L122-L126),
+     lines 122–126, same pinned commit) is just two fixed 240-byte
+     arrays, `key_enc[]` and `key_dec[]`, plus a length field — no
+     pointer back to a separately-stored "original key" to erase,
+     because there isn't one; the raw key bytes are already baked into
+     slot zero of the array that gets read on every sector. So this
+     step doesn't make the key harder to find in memory — if anything,
+     the schedule's later slots are additional derived material sitting
+     right next to the raw key, all inside the same `tfm`. What
+     changes is *access pattern*, not secrecy: encrypt/decrypt calls
+     read from this schedule array instead of re-running key expansion,
+     which is a performance property, not a security boundary. Whoever
+     could already read the raw key in kernel memory (see "Where it
+     lives," above — a kernel exploit, a physical DMA/cold-boot attack,
+     or root access to `/dev/kmem` where enabled) can read this
+     schedule too, for exactly the same reasons and through exactly the
+     same channels; expanding the key into a schedule adds no new
+     protection and removes none.
   3. **Every sector read or write afterward runs the cipher against
      that already-keyed `tfm`, not against the raw key.** For each
      sector, dm-crypt allocates a fresh per-request object
