@@ -203,17 +203,26 @@ being concrete about, since none of them are stated anywhere above:
      elsewhere in kernel memory (see "Where it lives," above): a
      kernel exploit, a physical DMA/cold-boot attack, or root access
      to `/dev/kmem` where enabled.
-  3. **Every sector read or write runs the cipher by reading that
+  3. **Every sector read or write runs the cipher against that
      schedule.** For each sector, dm-crypt allocates a fresh
      per-request object (`crypt_alloc_req_skcipher()`), binds it to
      the same, already-keyed `tfm` via `skcipher_request_set_tfm()`,
      and calls `crypto_skcipher_encrypt()` or
-     `crypto_skcipher_decrypt()`. Both read the schedule step 2 built
-     — the same array, containing the raw key at slot zero and the
-     derived round keys after it — over and over, sector after sector,
-     for as long as the volume stays mounted. Step 2's `setkey` call
-     runs once per unlock; step 3's read of what it produced runs
-     continuously.
+     `crypto_skcipher_decrypt()`. Neither function touches the
+     schedule directly: each pulls the `tfm` back off the request
+     (`crypto_skcipher_reqtfm(req)`) and dispatches to that backend's
+     registered encrypt/decrypt routine — on AES-NI,
+     `xts_encrypt_aesni()`/`xts_decrypt_aesni()`
+     (`arch/x86/crypto/aesni-intel_glue.c`, lines 592–593, same pinned
+     commit as above), which call down through `xts_crypt()` to
+     `aesni_xts_enc()`/`aesni_xts_dec()` (lines 490–501), the
+     assembly-implemented routines that actually take the
+     `crypto_aes_ctx` built in step 2 as an argument and read the
+     round keys out of it. That chain runs fresh for every sector,
+     over and over, for as long as the volume stays mounted, reading
+     the same schedule array — raw key at slot zero, derived round
+     keys after it — every time. Step 2's `setkey` call runs once per
+     unlock; step 3's use of what it produced runs continuously.
 
   Confirmed directly in
   [`drivers/md/dm-crypt.c`, pinned commit `43fd83c0`](https://github.com/torvalds/linux/blob/43fd83c0b1dc127cf13b4c05303665924e63ef94/drivers/md/dm-crypt.c)
