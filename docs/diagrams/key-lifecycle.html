@@ -1,0 +1,539 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LUKS2 Key Lifecycle</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+
+  :root {
+    --bg: #f6f5f2;
+    --bg-raised: #ffffff;
+    --ink: #1c2126;
+    --ink-soft: #4b5560;
+    --ink-faint: #7c8792;
+    --rule: #d8dbdd;
+    --rule-strong: #b7bcc0;
+    --accent: #2f6fa8;
+    --accent-ink: #ffffff;
+    --amber: #9a6a12;
+    --amber-bg: #fbeed6;
+    --amber-rule: #d9ab5c;
+    --code-bg: #eceae4;
+    --shadow: 0 1px 2px rgba(28,33,38,0.06), 0 8px 24px rgba(28,33,38,0.05);
+    --diagram-bg: #ffffff;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #14181d;
+      --bg-raised: #1b2127;
+      --ink: #e7e9ea;
+      --ink-soft: #aab2b9;
+      --ink-faint: #7c8792;
+      --rule: #2c333a;
+      --rule-strong: #3c454d;
+      --accent: #7fb2e5;
+      --accent-ink: #0d1720;
+      --amber: #e3b463;
+      --amber-bg: #2c2412;
+      --amber-rule: #6b5223;
+      --code-bg: #0f1317;
+      --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 8px 24px rgba(0,0,0,0.35);
+      --diagram-bg: #1b2127;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #14181d;
+    --bg-raised: #1b2127;
+    --ink: #e7e9ea;
+    --ink-soft: #aab2b9;
+    --ink-faint: #7c8792;
+    --rule: #2c333a;
+    --rule-strong: #3c454d;
+    --accent: #7fb2e5;
+    --accent-ink: #0d1720;
+    --amber: #e3b463;
+    --amber-bg: #2c2412;
+    --amber-rule: #6b5223;
+    --code-bg: #0f1317;
+    --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 8px 24px rgba(0,0,0,0.35);
+    --diagram-bg: #1b2127;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: 'IBM Plex Sans', ui-sans-serif, system-ui, sans-serif;
+    line-height: 1.55;
+  }
+
+  .page {
+    max-width: 980px;
+    margin: 0 auto;
+    padding: 3rem 1.5rem 5rem;
+  }
+
+  header.masthead {
+    border-bottom: 1px solid var(--rule-strong);
+    padding-bottom: 1.75rem;
+    margin-bottom: 2.25rem;
+  }
+
+  .eyebrow {
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-size: 0.72rem;
+    letter-spacing: 0.11em;
+    text-transform: uppercase;
+    color: var(--accent);
+    font-weight: 600;
+    margin: 0 0 0.6rem;
+  }
+
+  h1 {
+    font-size: clamp(1.8rem, 3.2vw, 2.5rem);
+    line-height: 1.15;
+    margin: 0 0 0.65rem;
+    text-wrap: balance;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+  }
+
+  .subtitle {
+    color: var(--ink-soft);
+    font-size: 1.02rem;
+    max-width: 62ch;
+    margin: 0 0 1.1rem;
+  }
+
+  .meta-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem 1.5rem;
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-size: 0.78rem;
+    color: var(--ink-faint);
+  }
+  .meta-row strong { color: var(--ink-soft); font-weight: 500; }
+
+  section { margin-bottom: 2.75rem; }
+
+  h2 {
+    font-size: 1.02rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-weight: 600;
+    color: var(--ink);
+    border-left: 3px solid var(--accent);
+    padding-left: 0.65rem;
+    margin: 0 0 1rem;
+  }
+
+  p { max-width: 68ch; color: var(--ink); }
+  p.lede { color: var(--ink-soft); }
+
+  .callout {
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    box-shadow: var(--shadow);
+    padding: 1.1rem 1.3rem;
+    max-width: 68ch;
+  }
+  .callout.finding {
+    border-left: 3px solid var(--accent);
+  }
+  .callout.finding .callout-label {
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-size: 0.7rem;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--accent);
+    font-weight: 600;
+    display: block;
+    margin-bottom: 0.5rem;
+  }
+
+  .legend {
+    display: flex;
+    gap: 1.5rem;
+    flex-wrap: wrap;
+    align-items: center;
+    font-size: 0.85rem;
+    color: var(--ink-soft);
+    margin-bottom: 1rem;
+  }
+  .legend-item { display: flex; align-items: center; gap: 0.45rem; }
+  .swatch { width: 0.85rem; height: 0.85rem; border-radius: 3px; flex: none; }
+  .swatch.verified { background: var(--bg-raised); border: 1.5px solid var(--rule-strong); }
+  .swatch.unverified { background: var(--amber-bg); border: 1.5px solid var(--amber-rule); }
+
+  .diagram-frame {
+    background: var(--diagram-bg);
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+    box-shadow: var(--shadow);
+    padding: 1.25rem;
+    overflow-x: auto;
+  }
+  .diagram-frame .mermaid {
+    min-width: 1100px;
+  }
+  .diagram-caption {
+    font-size: 0.82rem;
+    color: var(--ink-faint);
+    margin-top: 0.6rem;
+    max-width: 68ch;
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.85rem;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  thead th {
+    text-align: left;
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-size: 0.7rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    font-weight: 600;
+    padding: 0.6rem 0.9rem;
+    border-bottom: 1px solid var(--rule-strong);
+  }
+  tbody td {
+    padding: 0.55rem 0.9rem;
+    border-bottom: 1px solid var(--rule);
+    color: var(--ink-soft);
+    vertical-align: top;
+  }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody td:first-child {
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    color: var(--ink);
+    white-space: nowrap;
+  }
+  tbody a { color: var(--accent); text-decoration: none; }
+  tbody a:hover { text-decoration: underline; }
+
+  code {
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    background: var(--code-bg);
+    padding: 0.1em 0.35em;
+    border-radius: 4px;
+    font-size: 0.88em;
+  }
+
+  ol.steps {
+    list-style: none;
+    counter-reset: step;
+    padding: 0;
+    margin: 0;
+    display: grid;
+    gap: 0.9rem;
+    max-width: 68ch;
+  }
+  ol.steps li {
+    counter-increment: step;
+    position: relative;
+    padding-left: 2.4rem;
+    color: var(--ink-soft);
+    font-size: 0.92rem;
+  }
+  ol.steps li::before {
+    content: counter(step);
+    position: absolute;
+    left: 0;
+    top: 0.05rem;
+    width: 1.65rem;
+    height: 1.65rem;
+    border-radius: 50%;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule-strong);
+    color: var(--ink);
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-size: 0.78rem;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  ol.steps strong { color: var(--ink); }
+
+  footer {
+    border-top: 1px solid var(--rule);
+    padding-top: 1.25rem;
+    margin-top: 3rem;
+    font-size: 0.8rem;
+    color: var(--ink-faint);
+  }
+  footer a { color: var(--accent); }
+
+  @media (max-width: 640px) {
+    .page { padding: 2rem 1rem 3.5rem; }
+  }
+</style>
+</head>
+<body>
+
+<div class="page">
+  <header class="masthead">
+    <p class="eyebrow">luks-doctor · dm-crypt internals</p>
+    <h1>The LUKS2 master key's kernel lifecycle</h1>
+    <p class="subtitle">
+      A source-verified function-call diagram tracing the plaintext master key
+      from <code>luksOpen</code> through per-sector encrypt/decrypt to
+      <code>luksClose</code> — every edge fetched from real kernel source at a
+      pinned commit, not narrated from memory.
+    </p>
+    <div class="meta-row">
+      <span><strong>Repo:</strong> luks-doctor</span>
+      <span><strong>Doc:</strong> docs/af-splitting-explained.md</span>
+      <span><strong>Verified:</strong> 2026-08-20</span>
+      <span><strong>Kernel:</strong> torvalds/linux, multiple pinned commits</span>
+    </div>
+  </header>
+
+  <section>
+    <div class="callout finding">
+      <span class="callout-label">Why this graph looks the way it does</span>
+      <p style="margin:0; max-width: 62ch;">
+        An earlier draft of the source doc cited <code>crypto_aes_ctx</code> /
+        <code>aes_expandkey()</code> in <code>crypto/aes_generic.c</code> as
+        <em>the</em> generic AES key-schedule path. That file no longer
+        exists — a 2026 kernel restructuring ("crypto: aes &mdash; Replace
+        aes-generic with wrapper around lib") replaced it with
+        <code>crypto/aes.c</code>, a thin wrapper backed by a new
+        <code>lib/crypto/aes.c</code>. As a direct result, <code>xts(aes)</code>
+        is registered <strong>three separate times</strong> in the current
+        kernel, ranked by <code>cra_priority</code>, and
+        <code>crypto_alloc_skcipher()</code> picks whichever is highest and
+        available. Every layer below branches three ways for exactly this
+        reason.
+      </p>
+    </div>
+  </section>
+
+  <section>
+    <h2>Reading this diagram</h2>
+    <div class="legend">
+      <div class="legend-item"><span class="swatch verified"></span> Fully verified — every edge fetched and line-checked</div>
+      <div class="legend-item"><span class="swatch unverified"></span> Confirmed to exist, but at least one edge unverified</div>
+    </div>
+    <div class="diagram-frame">
+      <pre class="mermaid">
+flowchart TD
+    subgraph S1["1. tfm creation (luksOpen)"]
+        A1["crypt_alloc_tfms_skcipher()<br/>dm-crypt.c:2297"]
+        A2["crypto_alloc_skcipher('aes-xts-plain64', ...)<br/>picks highest-priority registered xts(aes)"]
+        A1 --> A2
+    end
+
+    subgraph S2["2. Backend selection (crypto API priority)"]
+        B1["xts-aes-aesni<br/>priority 401<br/>aesni-intel_glue.c:580-593"]
+        B2["xts-aes-lib<br/>priority 110<br/>crypto/aes.c:691-704"]
+        B3["xts(ecb(aes))<br/>template composition, inherited priority<br/>crypto/xts.c + crypto/ecb.c<br/>legacy path, unverified reachability"]
+        A2 -.->|AES-NI available| B1
+        A2 -.->|no AES-NI, lib compiled in<br/>always true in practice| B2
+        A2 -.->|structurally exists; whether it can<br/>still be selected is unverified| B3
+    end
+
+    subgraph S3["3. Keying — crypt_setkey() / crypto_skcipher_setkey(tfm,key,size)<br/>dm-crypt.c:2388-2414, called exactly once per unlock"]
+        C1["xts_setkey_aesni()<br/>aesni-intel_glue.c:358-376"]
+        C2["aes_set_key_common()<br/>aesni-intel_glue.c:98-113"]
+        C3a["aesni_set_key() [asm]<br/>SIMD usable"]
+        C3b["aes_expandkey()<br/>include/crypto/aes.h:146-160<br/>SIMD NOT usable"]
+        C4["struct crypto_aes_ctx<br/>(key_enc[], key_dec[], key_length)<br/>aes.h:122-126<br/>inside struct aesni_xts_ctx<br/>aesni-intel_glue.c:49-52"]
+
+        C5["crypto_aes_xts_setkey()<br/>crypto/aes.c:514-525"]
+        C6["aes_xts_preparekey()<br/>lib/crypto/aes.c:1206-1229"]
+        C7["struct aes_xts_key<br/>include/crypto/aes-xts.h"]
+
+        C8["xts_setkey() [generic template]<br/>crypto/xts.c:42-75"]
+        C9["child ecb(aes) skcipher_setkey()<br/>lskcipher adaptation shim — NOT verified"]
+        C10["crypto_aes_setkey()<br/>crypto/aes.c ~34-40"]
+        C11["aes_preparekey()<br/>include/crypto/aes.h:335<br/>struct aes_key"]
+
+        B1 --> C1 --> C2
+        C2 -->|SIMD usable| C3a --> C4
+        C2 -->|SIMD unusable| C3b --> C4
+
+        B2 --> C5 --> C6 --> C7
+
+        B3 --> C8 --> C9 --> C10 --> C11
+    end
+
+    subgraph S4["4. Bio entry & dispatch (per I/O request)"]
+        D1["device-mapper core<br/>invokes target's .map"]
+        D2["crypt_map()<br/>dm-crypt.c:3417-3496"]
+        D3["kcryptd_queue_crypt()<br/>dm-crypt.c:2233-2256<br/>WRITE path"]
+        D4["kcryptd_io_read() /<br/>kcryptd_queue_read()<br/>READ path, ciphertext fetch"]
+        D5["kcryptd_crypt()<br/>dm-crypt.c:2223-2231<br/>workqueue callback"]
+        D6["kcryptd_crypt_write_convert()<br/>dm-crypt.c:2041-2098"]
+        D7["kcryptd_crypt_read_convert()<br/>dm-crypt.c:2122-2146"]
+        D8["crypt_convert()<br/>dm-crypt.c:1515-1544"]
+        D9["crypt_alloc_req()<br/>dm-crypt.c:1477-1484"]
+        D10["crypt_alloc_req_skcipher()<br/>dm-crypt.c:1431-1442<br/>skcipher_request_set_tfm() binds<br/>request to already-keyed tfm"]
+        D11["crypt_convert_block_skcipher()<br/>dm-crypt.c:1352-1418"]
+        D12["crypto_skcipher_encrypt() /<br/>crypto_skcipher_decrypt()<br/>dm-crypt.c:1416/1418<br/>skcipher.c: pulls tfm off request,<br/>dispatches to alg-&gt;encrypt/decrypt"]
+
+        D1 --> D2
+        D2 -->|WRITE| D3 --> D5
+        D2 -->|READ| D4 --> D5
+        D5 -->|WRITE| D6 --> D8
+        D5 -->|READ| D7 --> D8
+        D8 --> D9 --> D10
+        D8 --> D11 --> D12
+    end
+
+    subgraph S5["5. Per-sector encrypt/decrypt (runs continuously, once per sector)"]
+        E1a["xts_encrypt_aesni() / xts_decrypt_aesni()<br/>aesni-intel_glue.c:592-593"]
+        E1b["xts_crypt()<br/>aesni-intel_glue.c:452-480"]
+        E1c["aesni_xts_encrypt() / aesni_xts_decrypt()<br/>aesni-intel_glue.c:490-501"]
+        E1d["aesni_xts_enc() / aesni_xts_dec() [asm]<br/>reads struct crypto_aes_ctx directly"]
+
+        E2a["crypto_aes_xts_encrypt() / crypto_aes_xts_decrypt()<br/>crypto/aes.c:576-603"]
+        E2b["aes_xts_encrypt() / aes_xts_decrypt()<br/>lib/crypto/aes.c:1401-1431"]
+        E2c["aes_xts_encrypt_nocts() / _decrypt_nocts()<br/>lib/crypto/aes.c:1285-1318"]
+        E2d["aes_xts_encrypt_arch() / _decrypt_arch()<br/>weak hooks, no x86 override found<br/>lib/crypto/aes.c:1241-1256"]
+        E2e["aes_xts_crypt_nocts_blockbyblock()<br/>lib/crypto/aes.c:1258-1282"]
+        E2f["aes_encrypt() / aes_decrypt()<br/>lib/crypto/aes.c:511-523<br/>reads struct aes_xts_key"]
+
+        E3a["xts_encrypt() / xts_decrypt() [template]<br/>crypto/xts.c:262-294"]
+        E3b["child ecb(aes) encrypt/decrypt<br/>crypto/ecb.c:16-54"]
+        E3c["crypto_aes_encrypt() / crypto_aes_decrypt()<br/>crypto/aes.c ~41-47"]
+
+        D12 -->|AES-NI backend| E1a --> E1b --> E1c --> E1d
+        D12 -->|xts-aes-lib backend, fast/linear path| E2a --> E2b
+        E2a -->|nonlinear/HIGHMEM| E2c
+        E2b --> E2c --> E2d
+        E2d -->|falls through, no arch override| E2e --> E2f
+        D12 -->|xts-ecb-aes backend, unverified reachability| E3a --> E3b --> E3c --> E2f
+    end
+
+    subgraph S6["6. Teardown (luksClose)"]
+        F1["crypt_dtr()"]
+        F2["kfree_sensitive(cc)<br/>zeroes struct crypt_config<br/>source comment: 'Must zero key material before freeing'"]
+        F3["crypt_free_tfms_skcipher()<br/>loops every tfms[i]"]
+        F4["crypto_free_skcipher()<br/>skcipher.h:328-331<br/>doc comment: 'zeroize and free cipher handle'"]
+        F5["crypto_destroy_tfm()<br/>api.c:617-631"]
+        F6["kfree_sensitive(mem)<br/>zeroes tfm context —<br/>including whichever key<br/>schedule struct from step 3"]
+
+        F1 --> F2
+        F1 --> F3 --> F4 --> F5 --> F6
+    end
+
+    C4 -.-> D10
+    C7 -.-> D10
+    C4 -.-> F6
+    C7 -.-> F6
+
+    classDef unverified fill:#fbeed6,stroke:#d9ab5c,color:#664d03
+    class B3,C9,E3a,E3b,E3c unverified
+      </pre>
+    </div>
+    <p class="diagram-caption">
+      Dotted arrows mark conditional/priority-based selection. Solid arrows
+      are unconditional function calls. Amber nodes are structurally
+      confirmed but carry at least one unverified edge — most importantly,
+      the <code>lskcipher</code>-to-<code>skcipher</code> adaptation shim
+      that lets the generic <code>crypto/xts.c</code> template obtain a
+      handle to <code>ecb(aes)</code> now that <code>crypto/ecb.c</code>
+      registers it as an <code>lskcipher</code>, not a <code>skcipher</code>.
+    </p>
+  </section>
+
+  <section>
+    <h2>What changed from the three-step summary</h2>
+    <p class="lede" style="margin-bottom: 1.1rem;">
+      The prose version of this material in the source doc collapses to
+      three steps: create the cipher object, key it once, use it on every
+      sector. That's still true — but each step branches on which of three
+      real kernel implementations of <code>xts(aes)</code> wins selection.
+    </p>
+    <ol class="steps">
+      <li><strong>tfm creation</strong> is unconditional — one call,
+        one function, regardless of backend.</li>
+      <li><strong>Backend selection</strong> happens once per volume, driven
+        by <code>cra_priority</code>: AES-NI (401) beats the AES library
+        wrapper (110) beats the legacy template composition (uncertain,
+        lower). Whichever wins determines every function called downstream.</li>
+      <li><strong>Keying</strong> still runs exactly once per unlock
+        (<code>crypto_skcipher_setkey()</code> — confirmed to appear exactly
+        once in the whole of <code>dm-crypt.c</code>), but through a
+        different call chain and into a different struct depending on the
+        backend from step 2.</li>
+      <li><strong>Per-sector encrypt/decrypt</strong> is what actually runs
+        continuously — the diagram makes explicit that
+        <code>crypto_skcipher_encrypt()</code>/<code>decrypt()</code>
+        don't touch the key schedule directly; they dispatch to a
+        backend-specific routine several calls deeper that does.</li>
+      <li><strong>Teardown</strong> zeroes the key material twice,
+        independently: once when the <code>tfm</code> is freed
+        (<code>crypto_free_skcipher()</code> — documented in its own
+        comment as "zeroize and free cipher handle"), once when
+        <code>struct crypt_config</code> itself is freed.</li>
+    </ol>
+  </section>
+
+  <section>
+    <h2>Pinned source citations</h2>
+    <p class="lede" style="margin-bottom: 1rem;">Every function in the diagram above was fetched from these exact commits and checked line-by-line — not estimated, not recalled from training data.</p>
+    <div style="overflow-x:auto;">
+      <table>
+        <thead>
+          <tr><th>File</th><th>Pinned commit</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>drivers/md/dm-crypt.c</td><td><a href="https://github.com/torvalds/linux/tree/43fd83c0b1dc127cf13b4c05303665924e63ef94/drivers/md/dm-crypt.c" target="_blank" rel="noopener">43fd83c0</a></td></tr>
+          <tr><td>arch/x86/crypto/aesni-intel_glue.c</td><td><a href="https://github.com/torvalds/linux/tree/ea0c746ffa1e6e701d39a564f6286a3f5740826b/arch/x86/crypto/aesni-intel_glue.c" target="_blank" rel="noopener">ea0c746f</a></td></tr>
+          <tr><td>include/crypto/aes.h</td><td><a href="https://github.com/torvalds/linux/tree/d4e273a5065f81ca86eca48cb3fed55867cc0115/include/crypto/aes.h" target="_blank" rel="noopener">d4e273a5</a></td></tr>
+          <tr><td>crypto/aes.c</td><td><a href="https://github.com/torvalds/linux/tree/f70ad727d1d60a4dfcb1a22152d4169f9a205af9/crypto/aes.c" target="_blank" rel="noopener">f70ad727</a></td></tr>
+          <tr><td>lib/crypto/aes.c</td><td><a href="https://github.com/torvalds/linux/tree/561131a27f5533e6e63520b4bc43d9c832a27c09/lib/crypto/aes.c" target="_blank" rel="noopener">561131a2</a></td></tr>
+          <tr><td>crypto/xts.c</td><td><a href="https://github.com/torvalds/linux/tree/cae575fc09fa824900939960e33bc49b8e964d80/crypto/xts.c" target="_blank" rel="noopener">cae575fc</a></td></tr>
+          <tr><td>crypto/ecb.c</td><td><a href="https://github.com/torvalds/linux/tree/ef93f1562803cd7bb8159e3abedaf7f47dce4e35/crypto/ecb.c" target="_blank" rel="noopener">ef93f156</a></td></tr>
+          <tr><td>include/crypto/skcipher.h</td><td><a href="https://github.com/torvalds/linux/tree/f9bbd547cfb98b1c5e535aab9b0671a2ff22453a/include/crypto/skcipher.h" target="_blank" rel="noopener">f9bbd547</a></td></tr>
+          <tr><td>crypto/api.c</td><td><a href="https://github.com/torvalds/linux/tree/cae575fc09fa824900939960e33bc49b8e964d80/crypto/api.c" target="_blank" rel="noopener">cae575fc</a></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>Scope</h2>
+    <p>
+      This diagram covers only the master key's <strong>kernel-side
+      lifecycle</strong>. Two related diagrams are planned as separate work,
+      not yet built: tweak/IV generation (<code>iv_gen_ops</code>,
+      <code>crypt_iv_essiv</code>, referenced by the bio-dispatch layer above
+      but not traced here), and the full userspace-to-kernel unlock path
+      (keyslot unwrap, AF-merge, digest verification, the
+      <code>luksOpen</code> handoff into the graph above). Don't read this
+      page as covering either.
+    </p>
+  </section>
+
+  <footer>
+    Companion to <strong>docs/af-splitting-explained.md</strong> in the
+    <code>luks-doctor</code> repository. This file is self-contained and
+    renders locally in any browser (an internet connection is needed once,
+    to load Mermaid and the Google Fonts referenced above).
+  </footer>
+</div>
+
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  const isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+  mermaid.initialize({ startOnLoad: true, theme: isDark ? 'dark' : 'default', securityLevel: 'loose' });
+</script>
+</body>
+</html>

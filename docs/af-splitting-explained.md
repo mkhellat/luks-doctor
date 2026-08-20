@@ -419,6 +419,13 @@ being concrete about, since none of them are stated anywhere above:
   | `include/crypto/skcipher.h` | [`f9bbd547`](https://github.com/torvalds/linux/tree/f9bbd547cfb98b1c5e535aab9b0671a2ff22453a/include/crypto/skcipher.h) |
   | `crypto/api.c` | [`cae575fc`](https://github.com/torvalds/linux/tree/cae575fc09fa824900939960e33bc49b8e964d80/crypto/api.c) |
 
+  A themed, browsable version of this same diagram — same Mermaid
+  source, same citation table — is checked into this repo at
+  [`docs/diagrams/key-lifecycle.html`](diagrams/key-lifecycle.html);
+  open it directly in a browser (it loads Mermaid and its Google Fonts
+  from a CDN, so it needs a network connection once, but has no other
+  dependency).
+
 - **How LUKS2 knows the unwrap actually worked.** Decrypting a keyslot
   with the *wrong* passphrase doesn't fail loudly — symmetric
   decryption with the wrong key just produces wrong-looking bytes, not
