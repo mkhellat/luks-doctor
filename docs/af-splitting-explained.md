@@ -146,8 +146,9 @@ being concrete about, since none of them are stated anywhere above:
      available; dm-crypt logs which one it picked via
      `cra_driver_name`). At this point the `tfm` exists and knows *how*
      to do AES-XTS, but has no key yet.
-  2. **The raw key bytes are consumed exactly once, right after step 1
-     — turning them into a *key schedule* stored inside the `tfm`.** A
+  2. **The raw key bytes are consumed exactly once, immediately after
+     that empty `tfm` is created — turning them into a *key schedule*
+     stored inside it.** A
      key schedule is AES's own internal expansion of your key into a
      separate round key for each of its encryption rounds (14 rounds
      for AES-256, so 15 round keys) — this is `KeyExpansion()`, [FIPS
