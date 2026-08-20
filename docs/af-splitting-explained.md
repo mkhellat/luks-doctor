@@ -128,8 +128,11 @@ being concrete about, since none of them are stated anywhere above:
 - **What it's used for, mechanically.** This is the same plaintext
   master key from the first bullet above — already unwrapped from a
   keyslot and confirmed correct by the digest check below — being put
-  to its actual use: encrypting and decrypting sectors. That happens
-  inside a concrete kernel object, created in two separate steps:
+  to its actual use: encrypting and decrypting sectors, via a concrete
+  kernel object. Getting there, and then using it, breaks into three
+  distinct steps — object creation, one-time keying, and repeated use
+  — and keeping them separate is exactly what avoids the confusion
+  below about what happens "once" versus "constantly":
   1. **The cipher object gets created, empty, at unlock time — before
      the key is involved at all.** When a LUKS device is set up
      (`luksOpen`), dm-crypt calls `crypt_alloc_tfms_skcipher()`, which
@@ -143,50 +146,60 @@ being concrete about, since none of them are stated anywhere above:
      available; dm-crypt logs which one it picked via
      `cra_driver_name`). At this point the `tfm` exists and knows *how*
      to do AES-XTS, but has no key yet.
-  2. **The raw key bytes get expanded into a key schedule inside that
-     `tfm`, a single time, right after — that expansion step is not
-     repeated for every read or write. The `tfm` itself, holding that
-     already-expanded schedule, absolutely is accessed on every single
-     sector — there'd be no way to encrypt or decrypt anything
-     otherwise.** These are two different things, worth keeping
-     separate: dm-crypt calls `crypt_setkey()`, which calls
-     `crypto_skcipher_setkey(tfm, key, size)` exactly once, at unlock —
-     this runs AES's real key-schedule-expansion algorithm on the
-     plaintext key and stores the result *inside* the `tfm` object.
-     That's the only point where the raw key bytes themselves are fed
-     into anything. From then on, for every single sector read or
-     write, dm-crypt calls `crypt_alloc_req()`, which calls
-     `skcipher_request_set_tfm()` to bind a per-sector request to that
-     same `tfm`, and then `crypto_skcipher_encrypt()` or
-     `crypto_skcipher_decrypt()` actually runs the cipher — using the
-     key schedule already sitting inside the `tfm`, not the raw key
-     bytes again. So the `tfm` is in constant use, every sector, for as
-     long as the volume stays mounted; what happens exactly once is the
-     one-time step of turning the raw key into that schedule in the
-     first place.
+  2. **The raw key bytes are consumed exactly once, right after step 1
+     — turning them into a *key schedule* stored inside the `tfm`.** A
+     key schedule is AES's own internal expansion of your key into a
+     separate round key for each of its encryption rounds (14 rounds
+     for AES-256, so 15 round keys) — see FIPS-197's `KeyExpansion`
+     algorithm; in the kernel this is `crypto_aes_expand_key()`
+     (`crypto/aes_generic.c`), which the `tfm`'s `setkey` operation
+     calls internally. dm-crypt triggers this by calling
+     `crypt_setkey()`, which calls
+     `crypto_skcipher_setkey(tfm, key, size)`. This is the only point
+     in the entire volume-mount lifetime where the raw plaintext key
+     bytes are handed to anything; after this call returns, the
+     expanded schedule is what's stored inside the `tfm`, and the raw
+     key bytes are never referenced again for ordinary I/O.
+  3. **Every sector read or write afterward runs the cipher against
+     that already-keyed `tfm`, not against the raw key.** For each
+     sector, dm-crypt allocates a fresh per-request object
+     (`crypt_alloc_req_skcipher()`), binds it to the same, already-keyed
+     `tfm` via `skcipher_request_set_tfm()`, and then calls
+     `crypto_skcipher_encrypt()` or `crypto_skcipher_decrypt()`, which
+     walks the round-key schedule built in step 2 — the same schedule,
+     reused, sector after sector. So step 2 (turning the key into a
+     schedule) happens exactly once per unlock, while step 3 (using
+     that schedule) happens continuously, once per sector, for as long
+     as the volume stays mounted. Those are different claims about
+     different things — the *setup work* is one-time; the *object it
+     produced* is in constant use — and collapsing them into a single
+     "used once" or "used constantly" statement would misdescribe one
+     half of it.
 
   Confirmed directly in
   [`drivers/md/dm-crypt.c`](https://github.com/torvalds/linux/blob/master/drivers/md/dm-crypt.c)
-  (verified 2026-08-17): `crypt_alloc_tfms_skcipher()` populates
-  `cc->cipher_tfm.tfms[i]` via `crypto_alloc_skcipher()`; separately,
-  `crypt_setkey()` loops over those same `cc->cipher_tfm.tfms[i]`
-  objects, calling `crypto_skcipher_setkey(cc->cipher_tfm.tfms[i],
+  (verified 2026-08-20 against current `master`): step 1's
+  `crypt_alloc_tfms_skcipher()` populates `cc->cipher_tfm.tfms[i]` via
+  `crypto_alloc_skcipher()`. Step 2's `crypt_setkey()` loops over those
+  same `tfms[i]` objects, calling `crypto_skcipher_setkey(cc->cipher_tfm.tfms[i],
   cc->key + (i * subkey_size), subkey_size)` for each one — and this
-  exact call, `crypto_skcipher_setkey()`, appears exactly once in the
-  entire file, confirming it's genuinely a one-time step, not
-  something the per-sector path also does. That per-sector path is
-  separate: `crypt_alloc_req_skcipher()` calls
-  `skcipher_request_set_tfm(ctx->r.req, cc->cipher_tfm.tfms[key_index])`
-  to bind each sector's request to the (already-keyed) `tfm`, and
-  `crypt_convert_block_skcipher()` then calls
-  `crypto_skcipher_encrypt()`/`crypto_skcipher_decrypt()` to actually
-  run the cipher on that sector — both called fresh for every sector,
-  neither one touching `crypto_skcipher_setkey()`. `crypt_setkey()`
-  runs again if the key is later explicitly changed —
-  `crypt_wipe_key()` (covered in
+  exact call is the *only* call to `crypto_skcipher_setkey()` in the
+  entire file, confirming it's genuinely a one-time step per unlock,
+  not something the per-sector path also does. Step 3 is a completely
+  separate code path: `crypt_alloc_req_skcipher()` calls
+  `skcipher_request_set_tfm(ctx->r.req, cc->cipher_tfm.tfms[key_index])`,
+  and `crypt_convert_block_skcipher()` then calls
+  `crypto_skcipher_encrypt()`/`crypto_skcipher_decrypt()` — both run
+  fresh for every sector, and neither one calls
+  `crypto_skcipher_setkey()`. (`crypto_skcipher_encrypt()` also appears
+  once more, in a self-test helper used to validate a cipher choice
+  before committing to it — unrelated to the per-sector I/O path.)
+  `crypt_setkey()` does run again later, but only if the key is
+  explicitly replaced: `crypt_wipe_key()` (covered in
   [`cold-boot-and-dma-attacks.md`](cold-boot-and-dma-attacks.md)) calls
-  it too, loading fresh random bytes into the same, already-existing
-  `tfm` objects in place of the real key.
+  it to load fresh random bytes into the same, already-existing `tfm`
+  objects in place of the real key, destroying the old schedule.
+
   `aes-xts-plain64` is cryptsetup's default cipher for this step; that's
   it, there's no other role for this key anywhere in LUKS2.
 - **How LUKS2 knows the unwrap actually worked.** Decrypting a keyslot
