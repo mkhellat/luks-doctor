@@ -146,63 +146,106 @@ being concrete about, since none of them are stated anywhere above:
      available; dm-crypt logs which one it picked via
      `cra_driver_name`). At this point the `tfm` exists and knows *how*
      to do AES-XTS, but has no key yet.
-  2. **The raw key bytes are consumed exactly once, immediately after
-     that empty `tfm` is created — turning them into a *key schedule*
-     stored inside it.** A
+  2. **The raw key bytes are handed to exactly one function call,
+     immediately after that empty `tfm` is created, which expands them
+     into a *key schedule* stored inside it.** The raw bytes are not
+     used up or discarded by this call — they're copied into a larger
+     structure alongside derived round keys, as the next paragraph
+     details. What happens exactly once is the *call*, not something
+     that happens to the key's existence. A
      key schedule is AES's own internal expansion of your key into a
      separate round key for each of its encryption rounds (14 rounds
      for AES-256, so 15 round keys) — this is `KeyExpansion()`, [FIPS
      197](https://doi.org/10.6028/NIST.FIPS.197-upd1) §5.2, p. 17
-     (Algorithm 2). In the current kernel this is `aes_expandkey()`
-     (declared in
-     [`include/crypto/aes.h`](https://github.com/torvalds/linux/blob/d4e273a5065f81ca86eca48cb3fed55867cc0115/include/crypto/aes.h#L146-L160),
-     pinned commit `d4e273a5`, verified 2026-08-20; its own doc comment
-     says outright: *"Expands the AES key as described in FIPS-197"*),
-     which the `tfm`'s `setkey` operation calls internally. dm-crypt
-     triggers this by calling
-     `crypt_setkey()`, which calls
-     `crypto_skcipher_setkey(tfm, key, size)`. This is the only point
-     in the entire volume-mount lifetime where the raw plaintext key
-     bytes are handed to a *new* function call for ordinary I/O — but
-     that doesn't mean the raw bytes disappear afterward. The schedule
-     produced isn't some separate, derived secret that replaces the
-     key; per FIPS 197 Algorithm 2 (quoted above), the schedule's first
-     `Nk` words *are* the raw key, verbatim (`w[0..Nk-1] = key`), with
-     the remaining round keys computed from there. Concretely, the
-     kernel's `struct crypto_aes_ctx`
-     ([`include/crypto/aes.h`](https://github.com/torvalds/linux/blob/d4e273a5065f81ca86eca48cb3fed55867cc0115/include/crypto/aes.h#L122-L126),
-     lines 122–126, same pinned commit) is just two fixed 240-byte
-     arrays, `key_enc[]` and `key_dec[]`, plus a length field — no
-     pointer back to a separately-stored "original key" to erase,
-     because there isn't one; the raw key bytes are already baked into
-     slot zero of the array that gets read on every sector. So this
-     step doesn't make the key harder to find in memory — if anything,
-     the schedule's later slots are additional derived material sitting
-     right next to the raw key, all inside the same `tfm`. What
-     changes is *access pattern*, not secrecy: encrypt/decrypt calls
-     read from this schedule array instead of re-running key expansion,
-     which is a performance property, not a security boundary. Whoever
-     could already read the raw key in kernel memory (see "Where it
-     lives," above — a kernel exploit, a physical DMA/cold-boot attack,
-     or root access to `/dev/kmem` where enabled) can read this
-     schedule too, for exactly the same reasons and through exactly the
-     same channels; expanding the key into a schedule adds no new
-     protection and removes none.
-  3. **Every sector read or write afterward runs the cipher against
-     that already-keyed `tfm`, not against the raw key.** For each
-     sector, dm-crypt allocates a fresh per-request object
-     (`crypt_alloc_req_skcipher()`), binds it to the same, already-keyed
-     `tfm` via `skcipher_request_set_tfm()`, and then calls
-     `crypto_skcipher_encrypt()` or `crypto_skcipher_decrypt()`, which
-     walks the round-key schedule built in step 2 — the same schedule,
-     reused, sector after sector. So step 2 (turning the key into a
-     schedule) happens exactly once per unlock, while step 3 (using
-     that schedule) happens continuously, once per sector, for as long
-     as the volume stays mounted. Those are different claims about
-     different things — the *setup work* is one-time; the *object it
-     produced* is in constant use — and collapsing them into a single
-     "used once" or "used constantly" statement would misdescribe one
-     half of it.
+     (Algorithm 2). dm-crypt triggers this by calling `crypt_setkey()`,
+     which calls `crypto_skcipher_setkey(tfm, key, size)`. This is the
+     only point in the entire volume-mount lifetime where the raw
+     plaintext key bytes are handed to a *new* function call for
+     ordinary I/O — but that doesn't mean the raw bytes disappear
+     afterward; they're still sitting in the schedule this call
+     produces, as explained below.
+
+     Which concrete function `setkey` calls depends on which backend
+     the kernel picked for `xts(aes)` (see step 1's `cra_driver_name`
+     note above), but both real backends land in a
+     `crypto_aes_ctx`-shaped structure containing the raw key
+     unmodified:
+     - **With AES-NI** (the common case on x86, and what
+       `cra_driver_name` will show if available):
+       `xts_setkey_aesni()`
+       ([`arch/x86/crypto/aesni-intel_glue.c`](https://github.com/torvalds/linux/blob/ea0c746ffa1e6e701d39a564f6286a3f5740826b/arch/x86/crypto/aesni-intel_glue.c#L358-L376),
+       lines 358–376, pinned commit `ea0c746f`, verified 2026-08-20)
+       splits the 512-bit key in half and stores each half in its own
+       `struct crypto_aes_ctx` inside `struct aesni_xts_ctx { crypto_aes_ctx
+       tweak_ctx; crypto_aes_ctx crypt_ctx; }` (same file, lines
+       49–52), via `aes_set_key_common()` (lines 98–113) — which itself
+       either calls the AES-NI assembly routine `aesni_set_key()`, or,
+       if SIMD isn't usable in the current context, falls back to
+       `aes_expandkey()` (declared in
+       [`include/crypto/aes.h`](https://github.com/torvalds/linux/blob/d4e273a5065f81ca86eca48cb3fed55867cc0115/include/crypto/aes.h#L146-L160),
+       pinned commit `d4e273a5`, verified 2026-08-20; its own doc
+       comment says outright: *"Expands the AES key as described in
+       FIPS-197"*). Either way the output lands in the same
+       `crypto_aes_ctx`.
+     - **Without hardware acceleration**, the generic
+       `crypto/xts.c`
+       ([pinned commit `cae575fc`](https://github.com/torvalds/linux/blob/cae575fc09fa824900939960e33bc49b8e964d80/crypto/xts.c#L42-L74),
+       lines 42–74, verified 2026-08-20) template's `xts_setkey()`
+       splits the key and recursively calls `crypto_skcipher_setkey()`
+       on a child `ecb(aes)` transform, which bottoms out in
+       `crypto/aes.c`'s `crypto_aes_setkey()` calling `aes_preparekey()`
+       — a different, `struct aes_key`-based implementation with the
+       same underlying FIPS-197 expansion, just a different struct
+       layout.
+
+     Either way, per FIPS 197 Algorithm 2 (quoted above), the resulting
+     schedule's first `Nk` words *are* the raw key, verbatim (`w[0..Nk-1]
+     = key`), with the remaining round keys computed from there — it is
+     not a separate, derived secret that replaces the key; the raw
+     bytes are baked into slot zero of whichever schedule array gets
+     read on every sector. So this step doesn't make the key harder to
+     find in memory while the `tfm` is alive — the schedule's later
+     slots are additional derived material sitting right next to the
+     raw key, all inside the same `tfm`.
+
+     What this step *does* add is a specific cleanup contract: freeing
+     that `tfm` — `crypto_free_skcipher()`
+     ([`include/crypto/skcipher.h`](https://github.com/torvalds/linux/blob/f9bbd547cfb98b1c5e535aab9b0671a2ff22453a/include/crypto/skcipher.h#L328-L331),
+     lines 328–331, pinned commit `f9bbd547`, verified 2026-08-20) —
+     is documented, in its own comment, as "zeroize and free cipher
+     handle," and does so via `crypto_destroy_tfm()`
+     ([`crypto/api.c`](https://github.com/torvalds/linux/blob/cae575fc09fa824900939960e33bc49b8e964d80/crypto/api.c#L617-L631),
+     lines 617–631, same pinned commit as the generic xts.c above)
+     calling `kfree_sensitive(mem)` — the same explicit-zero-before-free
+     primitive already documented above for `crypt_dtr()`'s handling of
+     `struct crypt_config`, just applied to the `tfm`'s own allocation.
+     dm-crypt calls `crypto_free_skcipher()` on every `tfms[i]` during
+     teardown. So the schedule (raw key included) is wiped twice, by
+     two separate code paths, on `luksClose`: once when the `tfm` is
+     freed, once when `struct crypt_config` itself is freed. Whoever
+     could already read the raw key in kernel memory *before* teardown
+     (see "Where it lives," above — a kernel exploit, a physical
+     DMA/cold-boot attack, or root access to `/dev/kmem` where enabled)
+     can read this schedule too, for exactly the same reasons and
+     through exactly the same channels; expanding the key into a
+     schedule adds no new *exposure* while the volume stays mounted, but
+     it does mean two independent zero-on-free paths cover it at
+     teardown rather than one.
+  3. **Every sector read or write afterward runs the cipher by reading
+     that schedule array, not by calling `crypto_skcipher_setkey()`
+     again.** For each sector, dm-crypt allocates a fresh per-request
+     object (`crypt_alloc_req_skcipher()`), binds it to the same,
+     already-keyed `tfm` via `skcipher_request_set_tfm()`, and then
+     calls `crypto_skcipher_encrypt()` or `crypto_skcipher_decrypt()`,
+     which reads the schedule array built in step 2 — the same array
+     (raw key bytes and all, per step 2's correction above), read over
+     and over, sector after sector. So the *function call* that builds
+     the schedule (step 2) happens exactly once per unlock, while the
+     *functions that read it* (step 3) run continuously, once per
+     sector, for as long as the volume stays mounted. That's the real
+     one-time-versus-constant distinction: not "the key is used once
+     then gone," but "the call that builds the schedule runs once; the
+     calls that read the schedule it built run constantly."
 
   Confirmed directly in
   [`drivers/md/dm-crypt.c`, pinned commit `43fd83c0`](https://github.com/torvalds/linux/blob/43fd83c0b1dc127cf13b4c05303665924e63ef94/drivers/md/dm-crypt.c)
