@@ -258,6 +258,167 @@ being concrete about, since none of them are stated anywhere above:
 
   `aes-xts-plain64` is cryptsetup's default cipher for this step; that's
   it, there's no other role for this key anywhere in LUKS2.
+
+  #### Key-lifecycle call graph
+
+  The three-step summary above collapses real branching: which exact
+  functions run depends on which of three competing kernel
+  implementations of `xts(aes)` wins priority-based selection, and the
+  per-sector encrypt/decrypt path is driven by a bio-submission chain
+  never shown above. The diagram below traces every edge from
+  `luksOpen` through per-sector I/O to `luksClose`, each one verified
+  against real kernel source at a pinned commit (see the citation
+  table beneath it). This covers only the key lifecycle; separate
+  diagrams for tweak/IV generation and the full userspace-to-kernel
+  unlock path are planned but not yet built — don't read anything
+  below as covering those.
+
+  ```mermaid
+  flowchart TD
+      subgraph S1["1. tfm creation (luksOpen)"]
+          A1["crypt_alloc_tfms_skcipher()<br/>dm-crypt.c:2297"]
+          A2["crypto_alloc_skcipher('aes-xts-plain64', ...)<br/>picks highest-priority registered xts(aes)"]
+          A1 --> A2
+      end
+
+      subgraph S2["2. Backend selection (crypto API priority)"]
+          B1["xts-aes-aesni<br/>priority 401<br/>aesni-intel_glue.c:580-593"]
+          B2["xts-aes-lib<br/>priority 110<br/>crypto/aes.c:691-704"]
+          B3["xts(ecb(aes))<br/>template composition, inherited priority<br/>crypto/xts.c + crypto/ecb.c<br/>legacy path, unverified reachability"]
+          A2 -.->|AES-NI available| B1
+          A2 -.->|no AES-NI, lib compiled in<br/>always true in practice| B2
+          A2 -.->|structurally exists; whether it can<br/>still be selected is unverified| B3
+      end
+
+      subgraph S3["3. Keying — crypt_setkey() / crypto_skcipher_setkey(tfm,key,size)<br/>dm-crypt.c:2388-2414, called exactly once per unlock"]
+          C1["xts_setkey_aesni()<br/>aesni-intel_glue.c:358-376"]
+          C2["aes_set_key_common()<br/>aesni-intel_glue.c:98-113"]
+          C3a["aesni_set_key() [asm]<br/>SIMD usable"]
+          C3b["aes_expandkey()<br/>include/crypto/aes.h:146-160<br/>SIMD NOT usable"]
+          C4["struct crypto_aes_ctx<br/>(key_enc[], key_dec[], key_length)<br/>aes.h:122-126<br/>inside struct aesni_xts_ctx<br/>aesni-intel_glue.c:49-52"]
+
+          C5["crypto_aes_xts_setkey()<br/>crypto/aes.c:514-525"]
+          C6["aes_xts_preparekey()<br/>lib/crypto/aes.c:1206-1229"]
+          C7["struct aes_xts_key<br/>include/crypto/aes-xts.h"]
+
+          C8["xts_setkey() [generic template]<br/>crypto/xts.c:42-75"]
+          C9["child ecb(aes) skcipher_setkey()<br/>lskcipher adaptation shim — NOT verified"]
+          C10["crypto_aes_setkey()<br/>crypto/aes.c ~34-40"]
+          C11["aes_preparekey()<br/>include/crypto/aes.h:335<br/>struct aes_key"]
+
+          B1 --> C1 --> C2
+          C2 -->|SIMD usable| C3a --> C4
+          C2 -->|SIMD unusable| C3b --> C4
+
+          B2 --> C5 --> C6 --> C7
+
+          B3 --> C8 --> C9 --> C10 --> C11
+      end
+
+      subgraph S4["4. Bio entry & dispatch (per I/O request)"]
+          D1["device-mapper core<br/>invokes target's .map"]
+          D2["crypt_map()<br/>dm-crypt.c:3417-3496"]
+          D3["kcryptd_queue_crypt()<br/>dm-crypt.c:2233-2256<br/>WRITE path"]
+          D4["kcryptd_io_read() /<br/>kcryptd_queue_read()<br/>READ path, ciphertext fetch"]
+          D5["kcryptd_crypt()<br/>dm-crypt.c:2223-2231<br/>workqueue callback"]
+          D6["kcryptd_crypt_write_convert()<br/>dm-crypt.c:2041-2098"]
+          D7["kcryptd_crypt_read_convert()<br/>dm-crypt.c:2122-2146"]
+          D8["crypt_convert()<br/>dm-crypt.c:1515-1544"]
+          D9["crypt_alloc_req()<br/>dm-crypt.c:1477-1484"]
+          D10["crypt_alloc_req_skcipher()<br/>dm-crypt.c:1431-1442<br/>skcipher_request_set_tfm() binds<br/>request to already-keyed tfm"]
+          D11["crypt_convert_block_skcipher()<br/>dm-crypt.c:1352-1418"]
+          D12["crypto_skcipher_encrypt() /<br/>crypto_skcipher_decrypt()<br/>dm-crypt.c:1416/1418<br/>skcipher.c: pulls tfm off request,<br/>dispatches to alg-&gt;encrypt/decrypt"]
+
+          D1 --> D2
+          D2 -->|WRITE| D3 --> D5
+          D2 -->|READ| D4 --> D5
+          D5 -->|WRITE| D6 --> D8
+          D5 -->|READ| D7 --> D8
+          D8 --> D9 --> D10
+          D8 --> D11 --> D12
+      end
+
+      subgraph S5["5. Per-sector encrypt/decrypt (runs continuously, once per sector)"]
+          E1a["xts_encrypt_aesni() / xts_decrypt_aesni()<br/>aesni-intel_glue.c:592-593"]
+          E1b["xts_crypt()<br/>aesni-intel_glue.c:452-480"]
+          E1c["aesni_xts_encrypt() / aesni_xts_decrypt()<br/>aesni-intel_glue.c:490-501"]
+          E1d["aesni_xts_enc() / aesni_xts_dec() [asm]<br/>reads struct crypto_aes_ctx directly"]
+
+          E2a["crypto_aes_xts_encrypt() / crypto_aes_xts_decrypt()<br/>crypto/aes.c:576-603"]
+          E2b["aes_xts_encrypt() / aes_xts_decrypt()<br/>lib/crypto/aes.c:1401-1431"]
+          E2c["aes_xts_encrypt_nocts() / _decrypt_nocts()<br/>lib/crypto/aes.c:1285-1318"]
+          E2d["aes_xts_encrypt_arch() / _decrypt_arch()<br/>weak hooks, no x86 override found<br/>lib/crypto/aes.c:1241-1256"]
+          E2e["aes_xts_crypt_nocts_blockbyblock()<br/>lib/crypto/aes.c:1258-1282"]
+          E2f["aes_encrypt() / aes_decrypt()<br/>lib/crypto/aes.c:511-523<br/>reads struct aes_xts_key"]
+
+          E3a["xts_encrypt() / xts_decrypt() [template]<br/>crypto/xts.c:262-294"]
+          E3b["child ecb(aes) encrypt/decrypt<br/>crypto/ecb.c:16-54"]
+          E3c["crypto_aes_encrypt() / crypto_aes_decrypt()<br/>crypto/aes.c ~41-47"]
+
+          D12 -->|AES-NI backend| E1a --> E1b --> E1c --> E1d
+          D12 -->|xts-aes-lib backend, fast/linear path| E2a --> E2b
+          E2a -->|nonlinear/HIGHMEM| E2c
+          E2b --> E2c --> E2d
+          E2d -->|falls through, no arch override| E2e --> E2f
+          D12 -->|xts-ecb-aes backend, unverified reachability| E3a --> E3b --> E3c --> E2f
+      end
+
+      subgraph S6["6. Teardown (luksClose)"]
+          F1["crypt_dtr()"]
+          F2["kfree_sensitive(cc)<br/>zeroes struct crypt_config<br/>source comment: 'Must zero key material before freeing'"]
+          F3["crypt_free_tfms_skcipher()<br/>loops every tfms[i]"]
+          F4["crypto_free_skcipher()<br/>skcipher.h:328-331<br/>doc comment: 'zeroize and free cipher handle'"]
+          F5["crypto_destroy_tfm()<br/>api.c:617-631"]
+          F6["kfree_sensitive(mem)<br/>zeroes tfm context —<br/>including whichever key<br/>schedule struct from step 3"]
+
+          F1 --> F2
+          F1 --> F3 --> F4 --> F5 --> F6
+      end
+
+      C4 -.-> D10
+      C7 -.-> D10
+      C4 -.-> F6
+      C7 -.-> F6
+
+      classDef unverified fill:#fff3cd,stroke:#997404,color:#664d03
+      class B3,C9,E3a,E3b,E3c unverified
+  ```
+
+  Amber nodes are structurally confirmed to exist in source but have
+  at least one unverified edge — most importantly, the `lskcipher`-to-
+  `skcipher` adaptation shim that lets `crypto/xts.c`'s generic
+  template obtain a handle to `ecb(aes)` (now registered as an
+  `lskcipher`, not a `skcipher`, per the same kernel restructuring
+  described below). Do not treat amber nodes as fully verified the way
+  the rest of the graph is.
+
+  **The single biggest finding from building this diagram**: an
+  earlier version of this doc cited `crypto_aes_ctx`/`aes_expandkey()`
+  in `crypto/aes_generic.c` as *the* generic AES key-schedule path.
+  That file no longer exists — a 2026 kernel restructuring
+  (`crypto: aes - Replace aes-generic with wrapper around lib`)
+  replaced it with `crypto/aes.c` (a thin Crypto API wrapper) backed
+  by a new `lib/crypto/aes.c`. As a direct consequence, `xts(aes)` is
+  registered **three separate times** in the current kernel, ranked by
+  `cra_priority`, and `crypto_alloc_skcipher()` picks whichever is
+  highest and available — this diagram's Setup/Keying/Encrypt-Decrypt
+  layers all branch three ways for exactly this reason, not two.
+
+  **Citations** (all fetched and line-checked directly against the
+  pinned commit shown, verified 2026-08-20):
+
+  | File | Pinned commit |
+  |---|---|
+  | `drivers/md/dm-crypt.c` | [`43fd83c0`](https://github.com/torvalds/linux/tree/43fd83c0b1dc127cf13b4c05303665924e63ef94/drivers/md/dm-crypt.c) |
+  | `arch/x86/crypto/aesni-intel_glue.c` | [`ea0c746f`](https://github.com/torvalds/linux/tree/ea0c746ffa1e6e701d39a564f6286a3f5740826b/arch/x86/crypto/aesni-intel_glue.c) |
+  | `include/crypto/aes.h` | [`d4e273a5`](https://github.com/torvalds/linux/tree/d4e273a5065f81ca86eca48cb3fed55867cc0115/include/crypto/aes.h) |
+  | `crypto/aes.c` | [`f70ad727`](https://github.com/torvalds/linux/tree/f70ad727d1d60a4dfcb1a22152d4169f9a205af9/crypto/aes.c) |
+  | `lib/crypto/aes.c` | [`561131a2`](https://github.com/torvalds/linux/tree/561131a27f5533e6e63520b4bc43d9c832a27c09/lib/crypto/aes.c) |
+  | `crypto/xts.c` | [`cae575fc`](https://github.com/torvalds/linux/tree/cae575fc09fa824900939960e33bc49b8e964d80/crypto/xts.c) |
+  | `crypto/ecb.c` | [`ef93f156`](https://github.com/torvalds/linux/tree/ef93f1562803cd7bb8159e3abedaf7f47dce4e35/crypto/ecb.c) |
+  | `include/crypto/skcipher.h` | [`f9bbd547`](https://github.com/torvalds/linux/tree/f9bbd547cfb98b1c5e535aab9b0671a2ff22453a/include/crypto/skcipher.h) |
+  | `crypto/api.c` | [`cae575fc`](https://github.com/torvalds/linux/tree/cae575fc09fa824900939960e33bc49b8e964d80/crypto/api.c) |
+
 - **How LUKS2 knows the unwrap actually worked.** Decrypting a keyslot
   with the *wrong* passphrase doesn't fail loudly — symmetric
   decryption with the wrong key just produces wrong-looking bytes, not

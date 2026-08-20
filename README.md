@@ -96,9 +96,11 @@ and secondary headers legitimately differ — is in
   primary/secondary header differences, command reference.
 - [`docs/af-splitting-explained.md`](docs/af-splitting-explained.md) —
   beginner-friendly, byte-by-byte deep dive into the AF-split/merge
-  algorithm itself, with a hand-traceable worked example and a concrete
+  algorithm itself, with a hand-traceable worked example, a concrete
   demonstration of why a single flipped bit makes a keyslot
-  unrecoverable.
+  unrecoverable, and a source-verified function-call diagram of the
+  master key's kernel lifecycle (tfm creation through per-sector
+  encrypt/decrypt to teardown).
 - [`docs/checking-for-corruption.md`](docs/checking-for-corruption.md) —
   practical `dd`/`xxd` inspection walkthrough, healthy vs. corrupted
   example dumps, when `cryptsetup repair` helps and when it can't, and
@@ -249,6 +251,19 @@ that either doc is itself a scoped feature to implement directly:
   the generic "Argon2id is memory-hard, PBKDF2 isn't" summary this
   project's docs otherwise rely on. **Done**: see
   [`docs/kdf-comparison.md`](docs/kdf-comparison.md).
+- **Source-verified function-call diagrams of dm-crypt/LUKS2
+  internals.** The master key's kernel-side lifecycle (tfm creation,
+  keying, per-sector encrypt/decrypt, teardown/zeroization) is **done**
+  — see the "Key-lifecycle call graph" in
+  [`docs/af-splitting-explained.md`](docs/af-splitting-explained.md#key-lifecycle-call-graph).
+  Two further diagrams, same standard (every edge fetched and
+  line-verified against a pinned kernel commit, not narrated), are
+  planned as separate future work, not yet started: **(1)** tweak/IV
+  generation (`iv_gen_ops`, `crypt_iv_essiv`, etc.) — referenced by the
+  key-lifecycle diagram's bio-dispatch layer but not itself traced;
+  **(2)** the full userspace-to-kernel unlock path — keyslot unwrap,
+  AF-merge, digest verification, and the `luksOpen` handoff into the
+  kernel-side diagram that already exists.
 
 ## Contributing
 
