@@ -172,16 +172,92 @@
   .swatch.verified { background: var(--bg-raised); border: 1.5px solid var(--rule-strong); }
   .swatch.unverified { background: var(--amber-bg); border: 1.5px solid var(--amber-rule); }
 
+  .diagram-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.75rem;
+    flex-wrap: wrap;
+  }
+  .diagram-toolbar input[type="search"] {
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-size: 0.82rem;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule-strong);
+    border-radius: 6px;
+    color: var(--ink);
+    padding: 0.4rem 0.65rem;
+    width: 15rem;
+    max-width: 40vw;
+  }
+  .diagram-toolbar input[type="search"]::placeholder { color: var(--ink-faint); }
+  .diagram-toolbar input[type="search"]:focus {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  .diagram-toolbar button {
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-size: 0.78rem;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule-strong);
+    border-radius: 6px;
+    color: var(--ink-soft);
+    padding: 0.4rem 0.6rem;
+    cursor: pointer;
+    line-height: 1;
+  }
+  .diagram-toolbar button:hover { color: var(--ink); border-color: var(--accent); }
+  .diagram-toolbar button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .diagram-toolbar .zoom-group { display: flex; gap: 0.25rem; }
+  .diagram-toolbar .hint {
+    font-size: 0.76rem;
+    color: var(--ink-faint);
+    margin-left: auto;
+  }
+  .diagram-match-count {
+    font-size: 0.76rem;
+    color: var(--ink-faint);
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+  }
+
   .diagram-frame {
     background: var(--diagram-bg);
     border: 1px solid var(--rule);
     border-radius: 8px;
     box-shadow: var(--shadow);
-    padding: 1.25rem;
-    overflow-x: auto;
+    overflow: hidden;
+    position: relative;
+    height: 640px;
   }
-  .diagram-frame .mermaid {
-    min-width: 1100px;
+  .diagram-viewport {
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    cursor: grab;
+    touch-action: none;
+  }
+  .diagram-viewport.grabbing { cursor: grabbing; }
+  .diagram-pan-layer {
+    transform-origin: 0 0;
+    will-change: transform;
+    padding: 1.25rem;
+    display: inline-block;
+  }
+  .diagram-pan-layer .mermaid svg {
+    max-width: none !important;
+    display: block;
+  }
+  .diagram-node-flash > rect,
+  .diagram-node-flash > polygon {
+    animation: node-flash 1.6s ease-out;
+  }
+  @keyframes node-flash {
+    0%   { stroke: var(--accent); stroke-width: 4px; }
+    100% { stroke: var(--accent); stroke-width: 4px; opacity: 1; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .diagram-node-flash > rect,
+    .diagram-node-flash > polygon { animation: none; stroke: var(--accent); stroke-width: 3px; }
   }
   .diagram-caption {
     font-size: 0.82rem;
@@ -285,6 +361,7 @@
 </head>
 <body>
 
+
 <div class="page">
   <header class="masthead">
     <p class="eyebrow">luks-doctor · dm-crypt internals</p>
@@ -329,7 +406,19 @@
       <div class="legend-item"><span class="swatch verified"></span> Fully verified — every edge fetched and line-checked</div>
       <div class="legend-item"><span class="swatch unverified"></span> Confirmed to exist, but at least one edge unverified</div>
     </div>
+    <div class="diagram-toolbar">
+      <input type="search" id="diagram-search" placeholder="Jump to a function (e.g. crypt_setkey)" aria-label="Search diagram nodes">
+      <span class="diagram-match-count" id="diagram-match-count" aria-live="polite"></span>
+      <div class="zoom-group" role="group" aria-label="Zoom controls">
+        <button type="button" id="diagram-zoom-out" aria-label="Zoom out">−</button>
+        <button type="button" id="diagram-zoom-in" aria-label="Zoom in">+</button>
+        <button type="button" id="diagram-zoom-reset">Fit</button>
+      </div>
+      <span class="hint">Drag to pan · scroll to zoom</span>
+    </div>
     <div class="diagram-frame">
+      <div class="diagram-viewport" id="diagram-viewport">
+        <div class="diagram-pan-layer" id="diagram-pan-layer">
       <pre class="mermaid">
 flowchart TD
     subgraph S1["1. tfm creation (luksOpen)"]
@@ -440,6 +529,8 @@ flowchart TD
     classDef unverified fill:#fbeed6,stroke:#d9ab5c,color:#664d03
     class B3,C9,E3a,E3b,E3c unverified
       </pre>
+        </div>
+      </div>
     </div>
     <p class="diagram-caption">
       Dotted arrows mark conditional/priority-based selection. Solid arrows
@@ -529,6 +620,216 @@ flowchart TD
     to load Mermaid and the Google Fonts referenced above).
   </footer>
 </div>
+
+<script>
+(function () {
+  var viewport = document.getElementById('diagram-viewport');
+  var panLayer = document.getElementById('diagram-pan-layer');
+  var searchInput = document.getElementById('diagram-search');
+  var matchCount = document.getElementById('diagram-match-count');
+  var zoomInBtn = document.getElementById('diagram-zoom-in');
+  var zoomOutBtn = document.getElementById('diagram-zoom-out');
+  var resetBtn = document.getElementById('diagram-zoom-reset');
+  if (!viewport || !panLayer) return;
+
+  var state = { scale: 1, x: 0, y: 0, minScale: 0.15, maxScale: 4 };
+  var fitScale = 1;
+  var lastVpSize = '';  // viewport size at the last fit, "WxH"
+
+  function apply() {
+    panLayer.style.transform =
+      'translate(' + state.x + 'px,' + state.y + 'px) scale(' + state.scale + ')';
+  }
+
+  function clampScale(s) {
+    return Math.max(state.minScale, Math.min(state.maxScale, s));
+  }
+
+  function sizeSvgFromViewBox() {
+    var svg = panLayer.querySelector('svg');
+    if (!svg) return null;
+    var vb = svg.viewBox && svg.viewBox.baseVal;
+    if (!vb || !vb.width || !vb.height) return svg;
+    svg.setAttribute('width', vb.width);
+    svg.setAttribute('height', vb.height);
+    svg.style.width = vb.width + 'px';
+    svg.style.height = vb.height + 'px';
+    return svg;
+  }
+
+  function fitToView() {
+    var svg = sizeSvgFromViewBox();
+    if (!svg) return;
+    // Fit the pan layer's own box, not just the SVG: the transform is
+    // applied to the pan layer, whose box also includes its padding and
+    // the <pre>'s margins. offsetWidth/offsetHeight ignore transforms,
+    // so these are the unscaled dimensions.
+    var naturalWidth = panLayer.offsetWidth;
+    var naturalHeight = panLayer.offsetHeight;
+    var vpRect = viewport.getBoundingClientRect();
+    if (!naturalWidth || !naturalHeight) return;
+    lastVpSize = vpRect.width + 'x' + vpRect.height;
+    var padding = 40;
+    var scale = Math.min(
+      (vpRect.width - padding) / naturalWidth,
+      (vpRect.height - padding) / naturalHeight
+    );
+    // A large diagram can need a fit scale below the default minimum;
+    // lower the minimum so the fit view (and zooming out to it) works.
+    state.minScale = Math.min(0.15, scale);
+    scale = clampScale(scale);
+    fitScale = scale;
+    state.scale = scale;
+    state.x = (vpRect.width - naturalWidth * scale) / 2;
+    state.y = (vpRect.height - naturalHeight * scale) / 2;
+    apply();
+  }
+
+  function zoomBy(factor, center) {
+    var vpRect = viewport.getBoundingClientRect();
+    var cx = center ? center.x - vpRect.left : vpRect.width / 2;
+    var cy = center ? center.y - vpRect.top : vpRect.height / 2;
+    var newScale = clampScale(state.scale * factor);
+    var ratio = newScale / state.scale;
+    state.x = cx - (cx - state.x) * ratio;
+    state.y = cy - (cy - state.y) * ratio;
+    state.scale = newScale;
+    apply();
+  }
+
+  // Drag to pan.
+  var dragging = false, lastX = 0, lastY = 0;
+  viewport.addEventListener('pointerdown', function (e) {
+    dragging = true;
+    lastX = e.clientX; lastY = e.clientY;
+    viewport.classList.add('grabbing');
+    viewport.setPointerCapture(e.pointerId);
+  });
+  viewport.addEventListener('pointermove', function (e) {
+    if (!dragging) return;
+    state.x += e.clientX - lastX;
+    state.y += e.clientY - lastY;
+    lastX = e.clientX; lastY = e.clientY;
+    apply();
+  });
+  function endDrag(e) {
+    dragging = false;
+    viewport.classList.remove('grabbing');
+  }
+  viewport.addEventListener('pointerup', endDrag);
+  viewport.addEventListener('pointercancel', endDrag);
+  viewport.addEventListener('pointerleave', endDrag);
+
+  // Scroll to zoom.
+  viewport.addEventListener('wheel', function (e) {
+    e.preventDefault();
+    var factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+    zoomBy(factor, { x: e.clientX, y: e.clientY });
+  }, { passive: false });
+
+  if (zoomInBtn) zoomInBtn.addEventListener('click', function () { zoomBy(1.25); });
+  if (zoomOutBtn) zoomOutBtn.addEventListener('click', function () { zoomBy(1 / 1.25); });
+  if (resetBtn) resetBtn.addEventListener('click', fitToView);
+
+  // Search / jump-to-node: matches against each node's visible text,
+  // then each subgraph title (some functions, e.g. crypt_setkey(), only
+  // appear in a subgraph title, not in a node).
+  function allNodeGroups() {
+    var svg = panLayer.querySelector('svg');
+    if (!svg) return [];
+    var nodes = Array.prototype.slice.call(svg.querySelectorAll('g.node'));
+    var clusters = Array.prototype.slice.call(svg.querySelectorAll('g.cluster'));
+    return nodes.concat(clusters);
+  }
+
+  var lastFlashed = null;
+  function clearFlash() {
+    if (lastFlashed) { lastFlashed.classList.remove('diagram-node-flash'); lastFlashed = null; }
+  }
+
+  function jumpToNode(g) {
+    var svg = panLayer.querySelector('svg');
+    if (!svg || !g) return;
+    // For a subgraph, centre on its title text rather than the whole box.
+    // The title's foreignObject is much wider than the left-aligned text
+    // inside it, so centre on the text span (.nodeLabel) itself.
+    var target = g.classList.contains('cluster') &&
+      (g.querySelector('.cluster-label .nodeLabel') || g.querySelector('.cluster-label')) || g;
+    var gRect = target.getBoundingClientRect();
+    var vpRect = viewport.getBoundingClientRect();
+    var panRect = panLayer.getBoundingClientRect();
+    // Position of the node relative to the (unscaled) pan layer origin.
+    var nodeCenterX = (gRect.left + gRect.width / 2 - panRect.left) / state.scale;
+    var nodeCenterY = (gRect.top + gRect.height / 2 - panRect.top) / state.scale;
+    var targetScale = clampScale(Math.max(state.scale, 1));
+    state.scale = targetScale;
+    state.x = vpRect.width / 2 - nodeCenterX * targetScale;
+    state.y = vpRect.height / 2 - nodeCenterY * targetScale;
+    apply();
+    clearFlash();
+    g.classList.add('diagram-node-flash');
+    lastFlashed = g;
+  }
+
+  function runSearch(query) {
+    clearFlash();
+    var nodes = allNodeGroups();
+    query = (query || '').trim().toLowerCase();
+    if (!query) {
+      matchCount.textContent = '';
+      return;
+    }
+    var matches = nodes.filter(function (g) {
+      return (g.textContent || '').toLowerCase().indexOf(query) !== -1;
+    });
+    if (matches.length === 0) {
+      matchCount.textContent = 'no match';
+      return;
+    }
+    matchCount.textContent = matches.length === 1 ? '1 match' : matches.length + ' matches';
+    jumpToNode(matches[0]);
+  }
+
+  if (searchInput) {
+    var debounceTimer;
+    searchInput.addEventListener('input', function () {
+      clearTimeout(debounceTimer);
+      var q = searchInput.value;
+      debounceTimer = setTimeout(function () { runSearch(q); }, 150);
+    });
+    searchInput.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') { e.preventDefault(); runSearch(searchInput.value); }
+    });
+  }
+
+  // Wait for Mermaid to finish drawing (native on claude.ai artifacts,
+  // or the explicit mermaid.initialize() call in the standalone copy),
+  // then do the initial fit.
+  var settleTimer = null;
+  var observer = new MutationObserver(function () {
+    if (panLayer.querySelector('svg')) {
+      clearTimeout(settleTimer);
+      settleTimer = setTimeout(function () {
+        fitToView();
+      }, 120);
+    }
+  });
+  observer.observe(panLayer, { childList: true, subtree: true });
+  // In case the SVG is already present by the time this script runs.
+  if (panLayer.querySelector('svg')) {
+    setTimeout(fitToView, 120);
+  }
+  // Refit only when the viewport's own size changes. Browsers also fire
+  // resize when nothing relevant changed (e.g. a mobile address bar
+  // showing or hiding), and refitting then would discard the user's
+  // pan/zoom.
+  window.addEventListener('resize', function () {
+    var r = viewport.getBoundingClientRect();
+    if (r.width + 'x' + r.height === lastVpSize) return;
+    if (panLayer.querySelector('svg')) fitToView();
+  });
+})();
+</script>
 
 <script type="module">
   import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
