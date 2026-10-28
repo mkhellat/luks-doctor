@@ -41,10 +41,12 @@ Options:
   --insert-chars STR     Character set to try inserting (default: $INSERT_CHARS).
   -h, --help             Show this help and exit.
 
-Requires root (cryptsetup needs raw device access to test a passphrase).
+Needs read access to the device: root for a block device, none for
+an image file of the device that you own.
 
 Example:
   sudo $PROG --layout azerty /dev/sdX 'my-best-guess-passphrase'
+  $PROG ./device.img 'my-best-guess-passphrase'
 EOF
 }
 
@@ -108,9 +110,8 @@ case "$LAYOUT" in
     *) die "unknown --layout '$LAYOUT' (supported: qwerty, azerty, qwertz)" ;;
 esac
 
-if [ "$(id -u)" -ne 0 ]; then
-    die "must be run as root (cryptsetup needs raw device access)"
-fi
+[ -r "$DEVICE" ] ||
+    die "cannot read $DEVICE (a block device usually needs root)"
 
 # Adjacency reflects physical keyboard neighbors plus shift/symbol pairs
 # sharing a key - these are the substitution slips a typing finger or a
