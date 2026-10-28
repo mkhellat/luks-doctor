@@ -212,7 +212,7 @@ material. Because of AF-splitting's diffusion step (SHA-256 by
 default), a single bit flip anywhere in the stripe data still produces
 output that's statistically indistinguishable from correct, healthy
 noise — see
-[`af-splitting-explained.md`](af-splitting-explained.md#why-this-makes-corruption-unrecoverable-three-demonstrations)
+[`af-splitting-explained.md`](af-splitting-explained.md#what-damage-does-to-the-key)
 for a worked demonstration of exactly why.
 
 This isn't a gap this project's tooling happens to have — it's a gap

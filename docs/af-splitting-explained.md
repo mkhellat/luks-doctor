@@ -26,7 +26,11 @@ covers how the algorithm works.
 - [A worked example you can trace by hand](#a-worked-example-you-can-trace-by-hand)
   - [Splitting the key](#splitting-the-key)
   - [Merging the stripes back](#merging-the-stripes-back)
-- [Why this makes corruption unrecoverable: three demonstrations](#why-this-makes-corruption-unrecoverable-three-demonstrations)
+- [What is written to disk](#what-is-written-to-disk)
+- [What damage does to the key](#what-damage-does-to-the-key)
+  - [From damaged stripes to the key](#from-damaged-stripes-to-the-key)
+  - [From damaged ciphertext to stripes](#from-damaged-ciphertext-to-stripes)
+  - [What this means for recovery](#what-this-means-for-recovery)
 - [Mapping the toy example back to real LUKS2](#mapping-the-toy-example-back-to-real-luks2)
 - [What this means when you're inspecting a keyslot](#what-this-means-when-youre-inspecting-a-keyslot)
 
@@ -138,8 +142,9 @@ being concrete about, since none of them are stated anywhere above:
   [`luks2-header-anatomy.md`](luks2-header-anatomy.md) for the full
   unlock flow.
 - **Where it lives.** Never in cleartext on disk, anywhere. What's on
-  disk, per keyslot, is this key encrypted under your passphrase-derived
-  key and then AF-split (the whole subject of this document) — that's
+  disk, per keyslot, is this key AF-split (the whole subject of this
+  document) and then encrypted under your passphrase-derived key (see
+  [What is written to disk](#what-is-written-to-disk)) — that's
   the `area` region [`checking-for-corruption.md`](checking-for-corruption.md)
   walks through inspecting. In cleartext, it exists in two different
   places at two different points, each verified against the real
@@ -790,45 +795,39 @@ would read `64` instead, with no other structural change.
 That's the full answer to "what is *N*": it's `key_size` from a real
 keyslot, and it's commonly 32 or 64 bytes depending on cipher choice —
 32 being both the spec's own example value and a familiar round number.
-The rest of this document picks **N = 32 bytes** wherever a concrete
-key size is needed (the algorithm walkthrough next, then the fully
-worked toy example further down); nothing about AF-splitting's
-structure or the corruption arguments later in this document depends on
-which of those two common values you have on a real device — only the
-*number* of stripes and the *size* of each stripe scale with it, not the
-underlying logic.
+The algorithm is the same for both sizes. What the size changes is how
+damage spreads: `diffuse()` hashes the key-sized accumulator in 32-byte
+chunks (with SHA-256), so a 32-byte key is one chunk and a 64-byte key
+is two, which decides how much of the key one damaged stripe takes with
+it (see [What damage does to the key](#what-damage-does-to-the-key)).
 
 ## The real algorithm, in plain English
 
-This describes the actual algorithm implemented in `cryptsetup`'s
-`lib/luks1/af.c` (function names `AF_split`, `AF_merge`, and their
-`diffuse`/`hash_buf` helpers; unchanged in LUKS2, which reuses the LUKS1
-AF-splitter as-is) — unaltered, just narrated in words before you see it
-in bytes. Source, so you can check this yourself rather than take the
-narration on faith:
-[`lib/luks1/af.c` at commit `fb6b9480`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/fb6b9480fa519c70366d6743ec84cb0f3afcc8c7/lib/luks1/af.c)
-(pinned to a specific commit so this link doesn't rot if upstream later
-refactors the file; verified 2026-08-15 that `AF_split`/`AF_merge`/
-`diffuse`/`hash_buf` at that commit are byte-for-byte what's described
-below).
+This section narrates cryptsetup's AF splitter, `AF_split()` and
+`AF_merge()` with their helpers `diffuse()` and `hash_buf()`, from
+[`lib/luks1/af.c` at commit `fb6b9480`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/fb6b9480fa519c70366d6743ec84cb0f3afcc8c7/lib/luks1/af.c).
+The four functions are unchanged at the later commit
+[`bae21790`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/bae21790d59897ac50e5471f953f76b3a58aeeb6/lib/luks1/af.c)
+apart from moving down one line. LUKS2 uses this same LUKS1 code: its
+keyslot handler calls `AF_split()` when writing a keyslot and
+`AF_merge()` when unlocking one
+([`lib/luks2/luks2_keyslot_luks2.c`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/bae21790d59897ac50e5471f953f76b3a58aeeb6/lib/luks2/luks2_keyslot_luks2.c),
+lines 235 and 360).
 
-Before the code: what's `diffuse`, structurally, before you see how it
-hashes? It's a function that takes the accumulator buffer (same size as
-the key — for real LUKS2, 32+ bytes) and scrambles it, using a hash
-function, in a way that's easy to redo (merge needs to reproduce the
-exact same scramble) but impossible to invert without the accumulator's
-prior value. One detail matters for the worked example below: **a hash
-function only processes one digest-sized block at a time** (SHA-256's
-digest is 32 bytes), so if the accumulator is *larger* than one digest,
-`diffuse` chops it into digest-sized blocks and hashes each block
-separately — mixing in that block's own position (`0`, `1`, `2`, ...) as
-part of the hash input, so block 0 and block 1 of the same buffer hash
-differently even if their raw bytes happened to match. That per-block
-hash step is `hash_buf`, shown below. (The toy example further down uses
-a 2-byte accumulator — smaller than one SHA-256 digest — so it only ever
-has *one* block and never exercises this chopping step. Flagged again
-where it matters, in
-[Mapping the toy example back to real LUKS2](#mapping-the-toy-example-back-to-real-luks2).)
+The algorithm keeps one working buffer, the *accumulator*, the same
+size as the key: 32 or 64 bytes with cryptsetup's default key sizes.
+`diffuse()` replaces the accumulator with a hash of itself, but not a
+hash of the buffer as a whole. It cuts the buffer into chunks the size
+of the hash's digest (32 bytes for SHA-256) and hashes each chunk
+separately, prefixed with the chunk's index (0, 1, …); a last chunk
+shorter than a digest is hashed and the result cut to its length. A
+change to one chunk therefore changes that chunk's output and no other
+chunk's. Hash functions do not require this; SHA-256 accepts input of
+any length. The LUKS1 specification records it as an implementation
+error, as covered in
+[the problem section above](#the-problem-af-splitting-solves-restated-concretely).
+
+The per-chunk hash is `hash_buf()`:
 
 ```c
 static int hash_buf(const char *src, char *dst, uint32_t iv,
@@ -841,10 +840,13 @@ static int hash_buf(const char *src, char *dst, uint32_t iv,
 	iv = be32_to_cpu(iv);
 	if (crypt_hash_init(&hd, hash_name))
 		return -EINVAL;
+
 	if ((r = crypt_hash_write(hd, iv_char, sizeof(uint32_t))))
 		goto out;
+
 	if ((r = crypt_hash_write(hd, src, len)))
 		goto out;
+
 	r = crypt_hash_final(hd, dst, len);
 out:
 	crypt_hash_destroy(hd);
@@ -852,12 +854,10 @@ out:
 }
 ```
 
-— i.e. each block's hash input is the block's own index (`iv`, as a
-big-endian 32-bit integer) followed by the block's bytes. That index
-mix-in is the concrete mechanism behind "the block's position is part
-of what gets hashed," mentioned above. `hash_buf` itself doesn't decide
-how many blocks there are — that's `diffuse`, which calls it once per
-digest-sized block:
+Its hash input is the chunk's index as a big-endian 32-bit integer,
+followed by the chunk's bytes; `crypt_hash_final()` writes `len` bytes
+of the digest. `diffuse()` decides how many chunks there are and calls
+`hash_buf()` once for each:
 
 ```c
 static int diffuse(char *src, char *dst, size_t size, const char *hash_name)
@@ -893,32 +893,26 @@ static int diffuse(char *src, char *dst, size_t size, const char *hash_name)
 }
 ```
 
-This confirms the claim above precisely: `blocks = size / digest_size`
-whole blocks, each hashed with index `i` via `hash_buf`, plus one final
-short call for any remainder (`padding`). For a 32-byte accumulator with
-SHA-256 (32-byte digest), `blocks = 1` and `padding = 0` — exactly one
-`hash_buf` call, index `0`. That's the case the toy example (and real
-256-bit LUKS2 keys) land in; a larger accumulator would mean `blocks > 1`
-and multiple indexed calls, as described above. `struct crypt_hash` and
-`crypt_hash_init`/`_write`/`_final`/`_destroy` are not part of
-AF-splitting itself — they're cryptsetup's internal wrapper around
-whichever real crypto library it's built against (OpenSSL, gcrypt, NSS,
-or the kernel crypto API), so this code can call a generic "hash
-something" API without caring which backend is compiled in. The opaque
-type is declared in
-[`lib/crypto_backend/crypto_backend.h`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/fb6b9480fa519c70366d6743ec84cb0f3afcc8c7/lib/crypto_backend/crypto_backend.h#L28-49);
-the OpenSSL backend's concrete definition (a thin wrapper around
-`EVP_MD_CTX`) is in
-[`lib/crypto_backend/crypto_openssl.c`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/fb6b9480fa519c70366d6743ec84cb0f3afcc8c7/lib/crypto_backend/crypto_openssl.c#L55-57).
-Nothing about that indirection changes the algorithm — skip it if you
-just want the data flow.
+With SHA-256, a 32-byte accumulator is one chunk (`blocks = 1`,
+`padding = 0`) and a 64-byte accumulator is two (`blocks = 2`): bytes
+0–31 hashed with index 0, bytes 32–63 hashed with index 1.
 
-**Splitting** a key into N stripes, pictured first, then as steps. Read
-top to bottom — `buf` is the one accumulator, updated in place at each
-row:
+`struct crypt_hash` and `crypt_hash_init()`/`_write()`/`_final()`/
+`_destroy()` belong to cryptsetup's crypto backend layer, which wraps
+whichever library cryptsetup is built against; at commit `fb6b9480`,
+`lib/crypto_backend/` has backends for gcrypt, the kernel crypto API,
+Mbed TLS, Nettle, NSS and OpenSSL. The type is declared opaquely in
+[`lib/crypto_backend/crypto_backend.h`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/fb6b9480fa519c70366d6743ec84cb0f3afcc8c7/lib/crypto_backend/crypto_backend.h#L28-49)
+(line 28; the hash functions are declared on lines 45–49), and the
+OpenSSL backend defines it as a wrapper around `EVP_MD_CTX`
+([`lib/crypto_backend/crypto_openssl.c`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/fb6b9480fa519c70366d6743ec84cb0f3afcc8c7/lib/crypto_backend/crypto_openssl.c#L55-57),
+lines 55–57). None of this affects the algorithm.
+
+**Splitting** a key into *n* stripes (`AF_split()`, lines 91–119).
+`buf` is the accumulator, updated in place row by row:
 
 ```
-buf = 00...00                        (all-zero, key-sized)
+buf = 00...00                        (all zero, key-sized)
 
 stripe[0] (random)  --XOR-->  buf
                      buf = diffuse(buf)
@@ -926,93 +920,81 @@ stripe[0] (random)  --XOR-->  buf
 stripe[1] (random)  --XOR-->  buf
                      buf = diffuse(buf)
 
-        ...                         (repeat for every stripe except the last)
+        ...                         (every stripe except the last)
 
-stripe[N-2] (random) --XOR-->  buf
+stripe[n-2] (random) --XOR-->  buf
                      buf = diffuse(buf)
 
-stripe[N-1] = original_key XOR buf   (NOT random -- the real key enters
-                                       only here, XORed with the final buf)
+stripe[n-1] = key XOR buf            (not random: the key enters only
+                                      here, XORed with the final buf)
 ```
 
-1. Start with an all-zero "accumulator" buffer, the same size as the key.
-2. For each stripe *except the last* (stripes `0` through `N-2`):
-   a. Generate a stripe's worth of **cryptographically random bytes** —
-      call this the random stripe. Write it to the output.
-   b. XOR the random stripe into the accumulator.
-   c. Run the accumulator through a **diffusion function** (`diffuse`,
-      built from repeated hashing — SHA-256 by default) and replace the
-      accumulator with the result.
-3. The **final stripe** (stripe `N-1`) is not random at all: it's the
-   original key XORed with whatever the accumulator holds after all
-   those rounds.
+1. Start with an all-zero accumulator, the same size as the key.
+2. For each stripe except the last (stripes `0` to `n-2`):
+   1. fill the stripe with random bytes from `crypt_random_get()`
+      (line 104) and write it to the output;
+   2. XOR the stripe into the accumulator (line 108);
+   3. replace the accumulator with `diffuse(accumulator)` (line 109),
+      using the keyslot's `af.hash` (SHA-256 with cryptsetup's
+      defaults).
+3. Write the last stripe, `n-1`, as the key XORed with the accumulator
+   (line 114).
 
-**Merging** stripes back into the key reverses this exactly — same
-pipeline, read the diagram above top-to-bottom again, except the last
-step is an XOR *out* instead of *in*:
+**Merging** the stripes back into the key (`AF_merge()`, lines
+121–143) repeats the same accumulator steps over the stored stripes:
 
-1. Start with the same all-zero accumulator.
-2. For each stripe *except the last*, in the same order: XOR it into the
-   accumulator, then diffuse the accumulator — identical to the split
-   process, because the merge side needs to reconstruct the exact same
-   accumulator value the split side had.
-3. XOR the final stripe with the (now fully reconstructed) accumulator.
-   The result is the original key.
+1. Start with an all-zero accumulator.
+2. For each stripe except the last, in order, XOR it into the
+   accumulator and diffuse the accumulator (lines 132–134). This
+   rebuilds exactly the accumulator value the split ended with.
+3. XOR the last stripe with that accumulator (line 138). The result is
+   the key.
 
-The mixing-in-of-position inside `diffuse` (the `iv`/block-index in
-`hash_buf`, above) is what a cryptsetup source comment calls
-"anti-forensic" — combined with the XOR chain above, it's specifically
-what guarantees a partial stripe set carries no information (see
-[Why this makes corruption unrecoverable](#why-this-makes-corruption-unrecoverable-three-demonstrations)
-for what "no information" means concretely, not just asserted).
+No secret is involved apart from the key itself. The hash, the stripe
+count and the algorithm are all public. Recovering the key needs the
+final accumulator, and the final accumulator can only be rebuilt from
+every one of stripes `0` to `n-2`.
 
-Notice what's *not* here: there's no encryption key involved in
-AF-splitting itself, and no secret parameter beyond the original key
-being split. `diffuse`'s hash function is public, the stripe count is
-public, the algorithm is public — none of that matters, because the
-security property doesn't come from hiding the mechanism. It comes from
-the accumulator being **built incrementally from stripes you don't have
-all of**, so reconstructing it requires the full ordered set.
+Because `diffuse()` never mixes chunks, the split works chunk by chunk:
+chunk *j* of the final accumulator depends only on chunk *j* of each
+stripe, so chunk *j* of the key depends only on chunk *j* of every
+stripe. With SHA-256, a 64-byte key is in effect split as two
+independent 32-byte keys.
 
 ## A worked example you can trace by hand
 
-Real LUKS2 uses SHA-256 as the diffusion hash and 4000 stripes over a
-key whose length depends on the cipher chosen at `luksFormat` time
-(commonly 256-bit/32-byte or 512-bit/64-byte — see the previous section)
-— utterly infeasible to trace by hand either way, and that's the point
-(see
-[Mapping the toy example back to real LUKS2](#mapping-the-toy-example-back-to-real-luks2)).
-To actually *see* the algorithm's structure work, this section uses a toy
-version: a 2-byte "key," 3 stripes, and a fake, non-cryptographic stand-in
-for the diffusion hash that you can compute with addition instead of
-SHA-256:
+Real LUKS2 uses SHA-256 and 4000 stripes on a 32- or 64-byte key, far
+too much to follow by hand. This example uses a 2-byte key, 3 stripes,
+and an addition in place of the hash:
 
 ```
 toy_diffuse(block, index) = each byte of block, plus (index + 1), mod 256
 ```
 
-**This toy hash has zero cryptographic value** — it's linear, invertible,
-and has none of SHA-256's avalanche or one-way properties. It exists
-purely so the arithmetic in this section is checkable with a calculator.
-Every structural step (the XOR chain, the accumulator, the loop order)
-is otherwise identical to the real algorithm.
+The toy uses a single 2-byte chunk, so `toy_diffuse` is always called
+with index 0 and adds 1 to each byte. **This stand-in has no
+cryptographic properties at all.** It is linear and trivially
+invertible, and, unlike SHA-256, a change to one byte of its input
+changes only that byte of its output; it exists only so the arithmetic
+can be checked by hand. The XOR chain, the accumulator and the order
+of steps are the real algorithm's.
 
 Toy setup:
 
-- **Key to split** (`src`): `a5 3c` (2 bytes)
-- **Stripe count** (`N`): 3
-- **"Random" stripes**: normally a CSPRNG; for a reproducible worked
-  example, fixed here to `11 22` and `77 88`
+- **Key to split**: `a5 3c` (2 bytes)
+- **Stripe count** (*n*): 3
+- **"Random" stripes**: normally from a random number generator; fixed
+  here to `11 22` and `77 88` so the example is reproducible
 
 ### Splitting the key
 
-Start: accumulator (`buf`) = `00 00` (all zero, same size as the key).
+Start: accumulator (`buf`) = `00 00`.
 
-**Stripe 0** (not the last stripe, so: random + XOR + diffuse):
+**Stripe 0** (not the last stripe: random, XOR, diffuse):
 
 ```
-random stripe[0]     = 11 22        <- written to disk as-is
-buf = stripe[0] XOR buf_prev
+stripe[0]  = 11 22                 <- random
+buf = stripe[0] XOR buf
     = 11 22  XOR  00 00
     = 11 22
 buf = toy_diffuse(buf, index=0)
@@ -1020,54 +1002,50 @@ buf = toy_diffuse(buf, index=0)
     = 12 23
 ```
 
-**Stripe 1** (also not the last):
+**Stripe 1** (not the last stripe either):
 
 ```
-random stripe[1]     = 77 88        <- written to disk as-is
-buf = stripe[1] XOR buf_prev
+stripe[1]  = 77 88                 <- random
+buf = stripe[1] XOR buf
     = 77 88  XOR  12 23
     = 65 ab
-buf = toy_diffuse(buf, index=0)      (diffuse restarts its own internal
-                                       block index at 0 each call - this
-                                       is a fresh diffuse() call, not a
-                                       continuation)
+buf = toy_diffuse(buf, index=0)    (each diffuse() call numbers its
+                                    chunks from 0 again)
     = (0x65 + 1) mod 256, (0xab + 1) mod 256
     = 66 ac
 ```
 
-**Stripe 2** (the *last* stripe — no randomness, this is where the real
-key gets folded in):
+**Stripe 2** (the last stripe: no randomness; the key enters here):
 
 ```
-stripe[2] = src XOR buf
+stripe[2] = key XOR buf
           = a5 3c  XOR  66 ac
           = c3 90
 ```
 
-**What actually gets written to the keyslot's `area` on disk:**
+**The split material:**
 
 ```
 stripe[0]  stripe[1]  stripe[2]
 ┌───────┐ ┌───────┐  ┌───────┐
-│ 11 22 │ │ 77 88 │  │ c3 90 │      6 bytes total, laid out
-└───────┘ └───────┘  └───────┘      end-to-end in `area`
+│ 11 22 │ │ 77 88 │  │ c3 90 │      6 bytes, end to end
+└───────┘ └───────┘  └───────┘
  random     random    key XOR buf
 ```
 
-Notice: none of these three stripes, read individually, look like `a5 3c`
-or reveal anything about it. `stripe[0]` and `stripe[1]` are pure
-randomness by construction. `stripe[2]` is the key XORed with an
-accumulator value that itself depends on both prior random stripes —
-without them, `stripe[2]` alone is indistinguishable from random noise
-too.
+None of the three stripes on its own reveals anything about `a5 3c`:
+`stripe[0]` and `stripe[1]` are random, and `stripe[2]` is the key
+XORed with an accumulator that depends on both of them. A real keyslot
+does not store this material as it is; it encrypts it first, as
+described in
+[What is written to disk](#what-is-written-to-disk).
 
 ### Merging the stripes back
 
-Given all three stripes, reconstruction replays the identical
-accumulation:
+Given all three stripes, the merge rebuilds the same accumulator:
 
 ```
-buf = 00 00                                    (start over, same as split)
+buf = 00 00
 
 buf = stripe[0] XOR buf  = 11 22 XOR 00 00 = 11 22
 buf = toy_diffuse(buf, 0) = 12 23
@@ -1075,143 +1053,213 @@ buf = toy_diffuse(buf, 0) = 12 23
 buf = stripe[1] XOR buf  = 77 88 XOR 12 23 = 65 ab
 buf = toy_diffuse(buf, 0) = 66 ac
 
-recovered = stripe[2] XOR buf
-          = c3 90  XOR  66 ac
-          = a5 3c                               <- back to the original key
+key = stripe[2] XOR buf
+    = c3 90  XOR  66 ac
+    = a5 3c                         <- the original key
 ```
 
-`a5 3c` — the merge exactly reverses the split. This isn't a coincidence
-of the toy numbers; it's guaranteed by construction, because merge
-replays the exact same accumulator-building steps split used, then
-undoes the final XOR.
+The merge reproduces the key because it repeats exactly the
+accumulator steps the split took and then undoes the final XOR.
 
-## Why this makes corruption unrecoverable: three demonstrations
+## What is written to disk
 
-These three cases are what actually happens (traced through the same toy
-algorithm above) when a keyslot area is damaged — not just asserted, but
-shown:
+A keyslot's area holds the split material **encrypted**, not as it is.
+When cryptsetup writes a keyslot
+([`luks2_keyslot_luks2.c`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/bae21790d59897ac50e5471f953f76b3a58aeeb6/lib/luks2/luks2_keyslot_luks2.c),
+`luks2_keyslot_set_key()`, from line 149), it:
 
-**1. Flip one bit in the *first* stripe, then merge:**
+1. derives a key from the passphrase with the keyslot's KDF (line 208);
+2. splits the master key into 4000 stripes with `AF_split()` (line
+   235), into a buffer of `AF_split_sectors(key_size, 4000) × 512`
+   bytes: the split material, rounded up to whole 512-byte sectors
+   (line 224);
+3. encrypts that buffer with the passphrase-derived key and the
+   keyslot's area cipher (`area.encryption`), in 512-byte sectors whose
+   IVs count from 0 at the start of the area, and writes it at
+   `area.offset` (`luks2_encrypt_to_storage()`, lines 23–53, which
+   passes `SECTOR_SIZE` and an IV offset of 0 to
+   `crypt_storage_wrapper_init()`, line 38).
+
+`SECTOR_SIZE` is 512
+([`lib/libcryptsetup_macros.h`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/bae21790d59897ac50e5471f953f76b3a58aeeb6/lib/libcryptsetup_macros.h#L38-39),
+lines 38–39). The area cipher is the volume's own data cipher when it
+can be used for keyslots, and otherwise, or when the volume uses
+hardware OPAL encryption, `aes-xts-plain64` with a 512-bit key (`crypt_keyslot_get_encryption()` in
+[`lib/setup.c`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/bae21790d59897ac50e5471f953f76b3a58aeeb6/lib/setup.c#L6679-6720),
+lines 6679–6720; the fallback is set in
+[`configure.ac`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/bae21790d59897ac50e5471f953f76b3a58aeeb6/configure.ac#L812-813),
+lines 812–813). With cryptsetup's defaults, both are `aes-xts-plain64`
+with a 64-byte key, so the area holds 4000 × 64 = 256,000 bytes of
+encrypted split material, 500 sectors.
+
+Unlocking reverses this: derive the key from the passphrase, read and
+decrypt the same number of bytes from `area.offset`, `AF_merge()` them
+(lines 315–360), then check the result against the stored digest (see
+[How LUKS2 knows the unwrap actually worked](#aside-where-does-that-key-length-number-actually-come-from)).
+Unlocking does not read `af.stripes` from the header: it always uses
+`LUKS_STRIPES`, defined as 4000
+([`libcryptsetup_macros.h`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/bae21790d59897ac50e5471f953f76b3a58aeeb6/lib/libcryptsetup_macros.h#L62),
+line 62), and header validation only checks that `af.stripes` is an
+integer (`luks2_keyslot_validate()`, lines 709–714).
+
+The experiment
+[`experiments/keyslot-damage-e2e/`](../experiments/keyslot-damage-e2e)
+confirms this layout on a real volume: it formats a throwaway LUKS2
+image with cryptsetup, unlocks keyslot 0 with its own implementation
+of the steps above, and gets the same key that cryptsetup reports.
+
+## What damage does to the key
+
+Damage on disk reaches the key in two steps: decryption turns damaged
+ciphertext into damaged stripes, and the merge turns damaged stripes
+into a damaged key.
+
+### From damaged stripes to the key
+
+The toy example shows the structure, with one caveat: because the toy
+diffusion is an addition, damage in it stays in the byte it hit, while
+SHA-256 scrambles the whole chunk.
+
+**1. Flip one bit in the first stripe:**
 
 ```
-stripe[0]: 11 22  ->  10 22   (low bit flipped)
-```
+stripe[0]: 11 22  ->  10 22
 
-Redoing the merge with this corrupted `stripe[0]`:
-
-```
 buf = 10 22 XOR 00 00 = 10 22
 buf = toy_diffuse(buf, 0) = 11 23
-
 buf = 77 88 XOR 11 23 = 66 ab
 buf = toy_diffuse(buf, 0) = 67 ac
-
-recovered = c3 90 XOR 67 ac = a4 3c
+key = c3 90 XOR 67 ac = a4 3c       (should be a5 3c)
 ```
 
-`a4 3c`, not `a5 3c` — wrong, and not *close* to right in any meaningful
-sense (with a real cryptographic hash instead of the toy addition, one
-flipped input bit flips roughly half the output bits at each diffusion
-step, so the error doesn't stay localized to one byte — it's total
-garbage, not a small offset you could search around).
+The toy gets one bit wrong. In real LUKS2, the flipped bit goes through
+SHA-256 at the next `diffuse()`, which scrambles every byte of that
+32-byte chunk, and every later round keeps it scrambled; the other
+chunk is untouched. With a 64-byte key, one half of the key is wrong;
+with a 32-byte key, all of it is.
 
-**2. Flip one bit in the *last* stripe instead:**
+**2. Flip one bit in the last stripe:**
 
 ```
-stripe[2]: c3 90 -> c2 90
-recovered = c2 90 XOR 66 ac = a4 3c
+stripe[2]: c3 90  ->  c2 90
+key = c2 90 XOR 66 ac = a4 3c       (should be a5 3c)
 ```
 
-Also wrong. It doesn't matter which stripe gets damaged — first, last, or
-anywhere between — because every stripe participates in either building
-the accumulator or the final XOR. There is no "less important" stripe.
+The last stripe is never diffused, so the key is wrong in exactly the
+flipped bit, in the toy and in real LUKS2 alike.
 
-**3. Lose a whole stripe (simulating a truncated write or zeroed
-region):**
+**3. Lose a whole stripe:** without `stripe[0]`, the accumulator cannot
+be rebuilt, and no byte of the key can be computed. In real LUKS2 the
+same holds for any one of the 4000 stripes.
 
-Merging with only `stripe[0]` and `stripe[1]` present (as if `stripe[2]`
-were missing, or the reader assumed the wrong stripe count) doesn't
-produce a "close but short" answer — it doesn't even correspond to a
-coherent operation. `AF_merge` needs to know `N` (the stripe count) up
-front to know which stripe is "last" and treated as the XOR target rather
-than an accumulator input; get that count wrong — which happens
-automatically if the `area` region is truncated — and you're not
-recovering a damaged key, you're computing an unrelated value from
-mismatched inputs. In real `cryptsetup`, the expected stripe count comes
-from the keyslot's own JSON metadata (`af.stripes`, see
-[`luks2-header-anatomy.md#the-json-metadata-area`](luks2-header-anatomy.md#the-json-metadata-area)),
-so a truncated `area` region is generally caught as a structural
-mismatch before merge is even attempted — but the underlying reason it
-*can't* work is the same: partial stripe data is not partial key data,
-it's not key data at all.
+The experiment
+[`experiments/af-damage-locality/`](../experiments/af-damage-locality)
+runs cases 1 and 2 on the real algorithm with 4000 stripes and
+SHA-256: one flipped bit in any of stripes 1 to 3999 changes only the
+32-byte chunk of the key it lines up with, and one flipped bit in the
+last stripe changes one key byte.
+
+### From damaged ciphertext to stripes
+
+Damage on disk changes ciphertext, so what matters first is how much
+plaintext one damaged ciphertext byte affects. With the default
+`aes-xts-plain64`, that is one 16-byte block. XTS encrypts a sector as
+a series of 16-byte blocks, each XORed with a per-block tweak value,
+encrypted with the block cipher on its own, and XORed with the tweak
+again; the Linux kernel's implementation does exactly these three
+passes
+([`crypto/xts.c`](https://github.com/torvalds/linux/blob/cae575fc09fa824900939960e33bc49b8e964d80/crypto/xts.c#L77-L132),
+`xts_xor_tweak()`, lines 83–132, and `xts_encrypt()`, lines 262–277).
+So decrypting a damaged 16-byte block scrambles that block's 16 bytes
+of plaintext and nothing else.
+
+No XTS block crosses a stripe boundary: blocks start every 16 bytes
+from the start of each 512-byte sector, sectors start every 512 bytes
+from the start of the area, and stripes start every 64 bytes (or 32,
+for a 32-byte key), all multiples of 16. Each 64-byte stripe therefore
+holds exactly four XTS blocks. One damaged byte on disk therefore scrambles
+16 bytes of exactly one stripe, which means:
+
+| Damaged byte is in | Key bytes lost (64-byte key, SHA-256) |
+|---|---|
+| Stripes 1 to 3999 | the whole 32-byte chunk the block lines up with: half the key |
+| The last stripe | the 16 key bytes the block lines up with |
+
+Damage that spans several blocks loses the union of these.
+[`experiments/keyslot-damage-e2e/`](../experiments/keyslot-damage-e2e)
+measures exactly this on a real cryptsetup-formatted image: one flipped
+ciphertext byte in stripe 1 or stripe 2000 changed 32 key bytes, and
+one in the last stripe changed 16.
+
+### What this means for recovery
+
+The smallest possible loss, one 16-byte block in the last stripe,
+leaves 128 bits of the key unknown; anywhere else, at least 256 bits.
+Neither can be searched, so a keyslot with any damage to its encrypted
+split material (the first 256,000 bytes of the area, for a 64-byte key)
+cannot be repaired from its own data.
+
+cryptsetup cannot tell this apart from a wrong passphrase. The merged
+key fails the digest check, and `cryptsetup open --test-passphrase`
+prints the same message as for a wrong passphrase, "No key available
+with this passphrase.", with exit status 2 (measured in the same
+experiment). A device or image that ends before the end of the area
+fails differently: the read comes back short and cryptsetup reports
+"IO error while decrypting keyslot." (`luks2_decrypt_from_storage()`,
+lines 83–85).
 
 ## Mapping the toy example back to real LUKS2
 
-Real LUKS2 differs from the toy example in four ways, all of which make
-the anti-forensic property *stronger*, not different in kind:
+The toy differs from real LUKS2 in five ways:
 
-- **SHA-256 instead of toy addition.** SHA-256 is a real one-way hash
-  with strong avalanche behavior — changing a single input bit changes
-  roughly half the output bits, unpredictably. The toy hash's `+1 mod
-  256` is trivially invertible (subtract 1) and was chosen purely so the
-  worked example above is checkable by hand; it is not standing in for
-  SHA-256's actual security properties, only its role in the algorithm's
-  data flow.
-- **4000 stripes instead of 3.** More rounds of the same accumulator
-  chain — the structure is identical, just repeated thousands of times.
-  This is `af.stripes` in the keyslot's JSON metadata (see
-  [`luks2-header-anatomy.md#the-json-metadata-area`](luks2-header-anatomy.md#the-json-metadata-area)).
-- **A 256-bit (or larger) key instead of 2 bytes**, and correspondingly
-  larger stripes — this is why a keyslot's `Area length` is so much
-  bigger than the master key itself (see
-  [`luks2-header-anatomy.md#reading-area-offset--area-length`](luks2-header-anatomy.md#reading-area-offset--area-length)):
-  4000 stripes of a 32-byte key is 128,000 bytes, not 32.
-- **`diffuse` chops the accumulator into digest-sized blocks — the toy
-  example never does this.** The toy accumulator is 2 bytes, smaller
-  than a single SHA-256 digest (32 bytes), so every `toy_diffuse` call
-  above hashed (added-to, really) exactly one block. Real LUKS2's
-  accumulator is also key-sized (32+ bytes) but SHA-256's digest is also
-  32 bytes, so for a 256-bit key the accumulator still happens to fit in
-  one block; for a *larger* key (e.g. a 512-bit key from a different
-  cipher configuration) `diffuse` would chop the accumulator into
-  multiple 32-byte blocks and hash each one separately with its own
-  block index, mixing them back together. The toy example's single-XOR,
-  single-hash-call structure per stripe is accurate for a 256-bit key;
-  it undersells what `diffuse` does for anything larger. See
-  [The real algorithm, in plain English](#the-real-algorithm-in-plain-english)
-  for where this chopping step lives in the real code (`hash_buf`,
-  called once per block by `diffuse`).
-
-None of these differences change the *shape* of the argument in the
-[three demonstrations](#why-this-makes-corruption-unrecoverable-three-demonstrations)
-above — they only make the real thing more thoroughly unrecoverable when
-damaged, since SHA-256's avalanche effect means a single flipped bit
-corrupts the *entire* subsequent accumulator chain, not just nearby
-bytes.
+- **SHA-256 instead of addition.** Damage to a chunk changes the
+  whole SHA-256 output for that chunk: in
+  [`experiments/af-damage-locality/`](../experiments/af-damage-locality),
+  one flipped bit changed all 32 bytes of the chunk (31 in one run,
+  where a byte came out the same by chance). The toy's addition changes
+  only the damaged byte.
+- **32-byte chunks instead of one 2-byte chunk.** `diffuse()` hashes
+  each 32-byte chunk of the accumulator separately, so damage stays
+  within its chunk.
+- **4000 stripes instead of 3.** The accumulator chain is the same,
+  repeated 3999 times. Unlocking always uses 4000, whatever
+  `af.stripes` in the header says.
+- **A 32- or 64-byte key instead of 2 bytes.** The split material is
+  4000 × the key size: 128,000 bytes for a 32-byte key, 256,000 bytes
+  for a 64-byte key. The keyslot area recorded in the header
+  (`area.size`, shown by `inspect-keyslot` as "Area length") is at
+  least that; on the image the experiment formats, it is 258,048 bytes
+  for a 64-byte key.
+- **Encryption.** The toy stores its stripes as they are; a real
+  keyslot encrypts them with the area cipher before writing them, and
+  damage on disk reaches the stripes through that encryption.
 
 ## What this means when you're inspecting a keyslot
 
-Tying this back to the practical side
-([`checking-for-corruption.md`](checking-for-corruption.md)):
+Tying this back to [`checking-for-corruption.md`](checking-for-corruption.md):
 
-- **A healthy keyslot `area` looks like uniform random noise** — because,
-  per stripe, it either *is* literally random (every stripe except the
-  last) or is XORed against something that's cryptographically
-  indistinguishable from random (the last stripe). You cannot eyeball
-  "correct" vs. "gibberish" by looking at entropy alone — both look
-  identical. What you *can* spot is structural damage: long zero-runs,
-  repeating patterns, truncation — things real random data doesn't
-  produce (see
+- **A healthy keyslot area looks like uniform random bytes**, because
+  it is ciphertext. Looking at it cannot tell you whether it decrypts
+  to the right key. What you can spot is damage that real ciphertext
+  does not produce: long runs of zeros, repeated patterns, an area cut
+  short (see
   [`checking-for-corruption.md#what-corrupted-key-material-looks-like`](checking-for-corruption.md#what-corrupted-key-material-looks-like)).
-- **There is no partial recovery.** Not "harder," not "needs more
-  compute" — the three demonstrations above show mechanically why even a
-  single flipped bit, anywhere in any stripe, produces an unrelated
-  result, not a close one. `cryptsetup repair` cannot help here (see
-  [`checking-for-corruption.md#when-to-run-cryptsetup-repair-and-what-it-cant-fix`](checking-for-corruption.md#when-to-run-cryptsetup-repair-and-what-it-cant-fix))
-  because there's no structural inconsistency to resolve — the stripe
-  data is either bit-for-bit intact or the key is gone, and `repair`
-  operates one level up, on the JSON metadata that *describes* the
-  keyslot, not on the keyslot's key material itself.
-- **This is why `luksHeaderBackup` matters before any exploratory work.**
-  A backup taken before damage occurred has the intact stripes; nothing
-  computed from the damaged region afterward can substitute for them.
+- **A damaged keyslot cannot be recovered from its own data.** As
+  shown above, any damage leaves at least 128 bits of the key unknown.
+  `cryptsetup repair` does not help: its man page says it "will only
+  change the LUKS header, not any keyslot data", and that "if the
+  keyslot is corrupted, no recovery is possible. You have to use the
+  LUKS header backup"
+  ([`man/cryptsetup-repair.8.adoc`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/bae21790d59897ac50e5471f953f76b3a58aeeb6/man/cryptsetup-repair.8.adoc)).
+  It can print warnings for some damage, "usually only a low-entropy
+  area (like zeroed blocks)", but does not modify keyslots.
+- **Other keyslots hold their own copies.** Each keyslot stores the
+  master key separately, so if the volume has another keyslot whose
+  passphrase you know, that keyslot still opens the volume.
+- **A header backup taken before the damage restores the keyslot.**
+  `cryptsetup luksHeaderBackup` "stores a binary backup of the LUKS
+  header and keyslot area"
+  ([`man/cryptsetup-luksHeaderBackup.8.adoc`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/bae21790d59897ac50e5471f953f76b3a58aeeb6/man/cryptsetup-luksHeaderBackup.8.adoc)).
+  The same man page warns that such a backup, with any passphrase that
+  was valid when it was taken, opens the volume even after that
+  passphrase is removed from the device.
