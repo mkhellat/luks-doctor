@@ -29,6 +29,7 @@ on exit.
 | [`af-damage-locality/`](af-damage-locality) | How far damage to one AF stripe spreads into the merged key | `python3` |
 | [`keyslot-damage-e2e/`](keyslot-damage-e2e) | How one damaged byte in a real LUKS2 keyslot area reaches the key, and what cryptsetup reports | `cryptsetup`, `python3`, Python `cryptography` |
 | [`default-key-sizes/`](default-key-sizes) | Which master key size `luksFormat` picks for each cipher without `--key-size`, and which cipher the keyslot area uses | `cryptsetup`, `python3` |
+| [`header-anatomy/`](header-anatomy) | The binary header layout, how the primary and secondary headers differ, the default on-disk layout, and how cryptsetup handles a damaged primary header | `cryptsetup`, `python3`; up to 1 GiB RAM for the default Argon2id |
 
 ## Running
 
@@ -38,6 +39,7 @@ From the repository root:
 experiments/af-damage-locality/run
 experiments/keyslot-damage-e2e/run
 experiments/default-key-sizes/run
+experiments/header-anatomy/run
 ```
 
 The `run` scripts pass `shellcheck --shell=sh`. They were run under

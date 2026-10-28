@@ -1,0 +1,76 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Mohammadreza Khellat <mkhellat@beavernets.com>
+# Run the header anatomy experiment.  See README.md.
+#
+# Formats a throwaway 32 MiB LUKS2 image file with cryptsetup's
+# defaults (including Argon2id, which benchmarks for about 2 seconds
+# and can use up to 1 GiB of RAM), shows luksDump and the parsed
+# binary headers, then damages the primary header and shows how
+# cryptsetup reacts.  Needs no root and touches no block device.
+# Everything is deleted on exit.
+set -eu
+
+here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+
+for tool in cryptsetup python3 truncate dd cmp; do
+	command -v "$tool" >/dev/null 2>&1 || {
+		echo "error: $tool is required" >&2
+		exit 1
+	}
+done
+
+work=$(mktemp -d)
+trap 'rm -rf -- "$work"' EXIT INT TERM
+
+img=$work/test.img
+pass=$work/passphrase
+printf '%s' 'synthetic-test-passphrase' > "$pass"
+truncate -s 32M "$img"
+
+cryptsetup --version
+cryptsetup luksFormat --type luks2 --batch-mode --key-file "$pass" "$img"
+
+echo
+echo "== cryptsetup luksDump (salt and UUID values elided) =="
+cryptsetup luksDump "$img" |
+	sed -e 's/\(Salt:[[:space:]]*\).*/\1<random>/' \
+	    -e 's/^\([[:space:]]*\)\([0-9a-f][0-9a-f] \)\{8,\}.*$/\1<random>/' \
+	    -e 's/\(UUID:[[:space:]]*\).*/\1<random>/' \
+	    -e 's/\(Digest:[[:space:]]*\).*/\1<random>/'
+
+echo
+echo "== Parsed binary headers =="
+python3 -I "$here/parse_headers.py" "$img"
+
+# Damage the primary header: flip one byte inside its JSON area, which
+# the checksum covers.
+echo
+echo "== Damage: flip one byte of the primary JSON area =="
+cp "$img" "$work/before.img"
+printf '\377' | dd of="$img" bs=1 seek=8192 conv=notrunc status=none
+
+echo "-- luksDump on the damaged image (read-only):"
+if cryptsetup luksDump "$img" >/dev/null 2>"$work/err"; then
+	echo "   luksDump succeeded"
+else
+	echo "   luksDump failed: $(cat "$work/err")"
+fi
+if cmp -s "$img" "$work/before.img"; then
+	echo "   primary header now identical to before the damage"
+else
+	echo "   image still differs from before the damage"
+fi
+
+echo "-- cryptsetup repair on the damaged image:"
+if cryptsetup repair --batch-mode "$img" 2>"$work/err"; then
+	echo "   repair succeeded"
+else
+	echo "   repair failed: $(cat "$work/err")"
+fi
+python3 -I "$here/parse_headers.py" "$img" | grep -E 'checksum valid|salt'
+if cmp -s -n 12288 -i 4096 "$img" "$work/before.img"; then
+	echo "   primary JSON area identical to before the damage"
+else
+	echo "   primary JSON area differs from before the damage"
+fi
