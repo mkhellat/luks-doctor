@@ -464,6 +464,17 @@ test_passphrase() {
     esac
 }
 
+printf 'luks-doctor: testing the base guess itself... '
+if test_passphrase "$GUESS"; then
+    echo "MATCH"
+    echo
+    echo "luks-doctor: the base guess unlocks a keyslot as it is, so the"
+    echo "luks-doctor: passphrase is not the problem. If the volume still"
+    echo "luks-doctor: does not open, see docs/checking-for-corruption.md."
+    exit 0
+fi
+echo "no match"
+
 found=0
 n=0
 while IFS="$(printf '\t')" read -r candidate label; do
