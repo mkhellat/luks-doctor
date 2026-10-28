@@ -195,7 +195,7 @@ Three fields carry the most operational weight for diagnosis:
   ([`lib/luks2/luks2_disk_metadata.c`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/main/lib/luks2/luks2_disk_metadata.c),
   verified 2026-08-17). This is a plain integrity checksum, not a
   KDF-based verification like the master-key `digests` check (see
-  [`af-splitting-explained.md`](af-splitting-explained.md#aside-where-does-that-key-length-number-actually-come-from)) —
+  [`af-splitting-explained.md`](af-splitting-explained.md#how-a-wrong-key-is-detected)) —
   it only proves the header + JSON bytes weren't altered or corrupted in
   transit/at rest, nothing about any passphrase. A checksum mismatch
   doesn't cause a hard failure by itself: `LUKS2_disk_hdr_read()` reads

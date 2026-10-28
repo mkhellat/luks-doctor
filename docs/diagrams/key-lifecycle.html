@@ -378,8 +378,8 @@
     </p>
     <div class="meta-row">
       <span><strong>Repo:</strong> luks-doctor</span>
-      <span><strong>Doc:</strong> docs/af-splitting-explained.md</span>
-      <span><strong>Verified:</strong> 2026-08-20</span>
+      <span><strong>Doc:</strong> docs/master-key-lifecycle.md</span>
+      <span><strong>Verified:</strong> 2026-10-28</span>
       <span><strong>Kernel:</strong> torvalds/linux, multiple pinned commits</span>
     </div>
   </header>
@@ -388,7 +388,7 @@
     <div class="callout finding">
       <span class="callout-label">Why this graph looks the way it does</span>
       <p style="margin:0; max-width: 62ch;">
-        An earlier draft of the source doc cited
+        An earlier draft of <code>docs/af-splitting-explained.md</code> cited
         <code>crypto_aes_expand_key()</code> in <code>crypto/aes_generic.c</code>
         as the AES key-schedule routine. That function was real but long
         outdated: Linux v5.4 replaced it with the shared library routine
@@ -452,7 +452,7 @@ flowchart TD
         A2 -.->|structurally exists; whether it can<br/>still be selected is unverified| B3
     end
 
-    subgraph S3["3. Keying — crypt_setkey() / crypto_skcipher_setkey(tfm,key,size)<br/>dm-crypt.c:2388-2414, called exactly once per unlock"]
+    subgraph S3["3. Keying — crypt_setkey() / crypto_skcipher_setkey(tfm,key,size)<br/>dm-crypt.c:2388-2425, called exactly once per unlock"]
         C1["xts_setkey_aesni()<br/>aesni-intel_glue.c:358-376"]
         C2["aes_set_key_common()<br/>aesni-intel_glue.c:98-113"]
         C3a["aesni_set_key() [asm]<br/>SIMD usable"]
@@ -465,7 +465,7 @@ flowchart TD
 
         C8["xts_setkey() [generic template]<br/>crypto/xts.c:42-75"]
         C9["child ecb(aes) skcipher_setkey()<br/>lskcipher adaptation shim — NOT verified"]
-        C10["crypto_aes_setkey()<br/>crypto/aes.c ~34-40"]
+        C10["crypto_aes_setkey()<br/>crypto/aes.c:26-32"]
         C11["aes_preparekey()<br/>include/crypto/aes.h:335<br/>struct aes_key"]
 
         B1 --> C1 --> C2
@@ -484,10 +484,10 @@ flowchart TD
         D4["kcryptd_io_read() /<br/>kcryptd_queue_read()<br/>READ path, ciphertext fetch"]
         D5["kcryptd_crypt()<br/>dm-crypt.c:2223-2231<br/>workqueue callback"]
         D6["kcryptd_crypt_write_convert()<br/>dm-crypt.c:2041-2098"]
-        D7["kcryptd_crypt_read_convert()<br/>dm-crypt.c:2122-2146"]
-        D8["crypt_convert()<br/>dm-crypt.c:1515-1544"]
+        D7["kcryptd_crypt_read_convert()<br/>dm-crypt.c:2132-2165"]
+        D8["crypt_convert()<br/>dm-crypt.c:1515-1606"]
         D9["crypt_alloc_req()<br/>dm-crypt.c:1477-1484"]
-        D10["crypt_alloc_req_skcipher()<br/>dm-crypt.c:1431-1442<br/>skcipher_request_set_tfm() binds<br/>request to already-keyed tfm"]
+        D10["crypt_alloc_req_skcipher()<br/>dm-crypt.c:1431-1453<br/>skcipher_request_set_tfm() binds<br/>request to already-keyed tfm"]
         D11["crypt_convert_block_skcipher()<br/>dm-crypt.c:1352-1418"]
         D12["crypto_skcipher_encrypt() /<br/>crypto_skcipher_decrypt()<br/>dm-crypt.c:1416/1418<br/>skcipher.c: pulls tfm off request,<br/>dispatches to alg-&gt;encrypt/decrypt"]
 
@@ -515,7 +515,7 @@ flowchart TD
 
         E3a["xts_encrypt() / xts_decrypt() [template]<br/>crypto/xts.c:262-294"]
         E3b["child ecb(aes) encrypt/decrypt<br/>crypto/ecb.c:16-54"]
-        E3c["crypto_aes_encrypt() / crypto_aes_decrypt()<br/>crypto/aes.c ~41-47"]
+        E3c["crypto_aes_encrypt() / crypto_aes_decrypt()<br/>crypto/aes.c:34-47"]
 
         D12 -->|AES-NI backend| E1a --> E1b --> E1c --> E1d
         D12 -->|xts-aes-lib backend, fast/linear path| E2a --> E2b
@@ -562,7 +562,7 @@ flowchart TD
   <section>
     <h2>What changed from the three-step summary</h2>
     <p class="lede" style="margin-bottom: 1.1rem;">
-      The prose version of this material in the source doc collapses to
+      The prose version of this material in <code>docs/master-key-lifecycle.md</code> collapses to
       three steps: create the cipher object, key it once, use it on every
       sector. That's still true — but each step branches on which of three
       real kernel implementations of <code>xts(aes)</code> wins selection.
@@ -630,7 +630,7 @@ flowchart TD
   </section>
 
   <footer>
-    Companion to <strong>docs/af-splitting-explained.md</strong> in the
+    Companion to <strong>docs/master-key-lifecycle.md</strong> in the
     <code>luks-doctor</code> repository. This file is self-contained and
     renders locally in any browser (an internet connection is needed once,
     to load Mermaid and the Google Fonts referenced above).

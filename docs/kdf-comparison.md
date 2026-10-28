@@ -306,7 +306,7 @@ defensively or under-provisioning and getting it wrong.
 **Is this a meaningful weakness?** No — and framing it as one would
 overstate it, in the same spirit as this project's earlier correction
 of the XTS "doubles a 256-bit key" oversimplification (see
-[`af-splitting-explained.md`](af-splitting-explained.md#aside-where-does-that-key-length-number-actually-come-from)).
+[`af-splitting-explained.md`](af-splitting-explained.md#why-the-default-key-is-512-bits)).
 Every deployed KDF-based scheme necessarily discloses its own cost
 parameters — `/etc/shadow`'s `$6$rounds=...$` prefix, bcrypt's visible
 cost factor, scrypt's visible N/r/p — because a scheme that hid its

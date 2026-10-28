@@ -1,6 +1,6 @@
 # Cold Boot and DMA Attacks: A Different Threat Model Entirely
 
-[`af-splitting-explained.md`](af-splitting-explained.md#aside-where-does-that-key-length-number-actually-come-from)
+[`master-key-lifecycle.md`](master-key-lifecycle.md#where-the-key-lives-in-memory)
 documents precisely where a LUKS2 volume's cleartext master key lives
 while mounted: briefly in `cryptsetup`'s own memory during unlock, and
 then continuously, for as long as the volume stays mapped, inside the

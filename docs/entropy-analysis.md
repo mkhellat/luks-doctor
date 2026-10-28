@@ -134,7 +134,7 @@ below).
 
 A keyslot's `area` size is `af.stripes` (4000 by default) times
 `key_size` (see
-[`af-splitting-explained.md`](af-splitting-explained.md#aside-where-does-that-key-length-number-actually-come-from)
+[`af-splitting-explained.md`](af-splitting-explained.md#where-the-key-length-comes-from-per-code)
 for where `key_size` actually comes from per cipher choice):
 
 ```

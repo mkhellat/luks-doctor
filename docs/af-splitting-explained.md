@@ -18,15 +18,17 @@ covers how the algorithm works.
 ## Contents
 
 - [The problem AF-splitting solves, restated concretely](#the-problem-af-splitting-solves-restated-concretely)
-  - [Aside: where does that key-length number actually come from?](#aside-where-does-that-key-length-number-actually-come-from)
-    - [Where key length actually comes from, per code](#where-key-length-actually-comes-from-per-code)
-    - [The keyslot JSON object, sketched](#the-keyslot-json-object-sketched)
-    - [A real example, from the spec itself](#a-real-example-from-the-spec-itself)
+- [The key being split](#the-key-being-split)
+  - [Why the default key is 512 bits](#why-the-default-key-is-512-bits)
+  - [Where the key length comes from, per code](#where-the-key-length-comes-from-per-code)
+  - [The keyslot JSON object, sketched](#the-keyslot-json-object-sketched)
+  - [A real example, from the spec itself](#a-real-example-from-the-spec-itself)
 - [The real algorithm, in plain English](#the-real-algorithm-in-plain-english)
 - [A worked example you can trace by hand](#a-worked-example-you-can-trace-by-hand)
   - [Splitting the key](#splitting-the-key)
   - [Merging the stripes back](#merging-the-stripes-back)
 - [What is written to disk](#what-is-written-to-disk)
+  - [How a wrong key is detected](#how-a-wrong-key-is-detected)
 - [What damage does to the key](#what-damage-does-to-the-key)
   - [From damaged stripes to the key](#from-damaged-stripes-to-the-key)
   - [From damaged ciphertext to stripes](#from-damaged-ciphertext-to-stripes)
@@ -52,7 +54,7 @@ Overwriting a sector does not guarantee the old data is gone. When a
 sector starts to fail, disk firmware remaps it to a reserved area, and
 the old copy stays there, where no overwrite of the original address
 can reach it. A master key is only 32 or 64 bytes with cryptsetup's
-default key sizes (see the aside below), so its encrypted copy
+default key sizes (see [The key being split](#the-key-being-split)), so its encrypted copy
 fits in a single sector and can survive such a remap whole. Fruhwirth,
 who designed AF-splitting and LUKS, describes this as the problem the
 splitter solves: encrypted key material "is typically very short and
@@ -124,607 +126,188 @@ devices. The functionality is here mainly for compatibility reasons"
 The rest of this document works through the construction with a
 concrete *N*, so you can trace real numbers rather than reason about
 an abstract key. *N* is not a fixed size that LUKS2 defines once; it
-is determined by choices made at `luksFormat` time, which the aside
-below traces through cryptsetup's code.
+is determined by choices made at `luksFormat` time, which the next
+section traces through cryptsetup's code.
 
-### Aside: where does that key-length number actually come from?
+## The key being split
 
-Before getting into *why* the number is what it is, three things worth
-being concrete about, since none of them are stated anywhere above:
+The key AF-splitting splits is the volume's master key: the random key
+dm-crypt uses to encrypt the volume's data, generated once at
+`luksFormat`. Each keyslot stores its own copy of it, split and then
+encrypted under a key derived from that keyslot's passphrase. Where the
+plaintext key exists in memory, and how the kernel uses it, is covered
+in [`master-key-lifecycle.md`](master-key-lifecycle.md).
 
-- **What this key actually is.** It's the one secret dm-crypt uses to
-  encrypt and decrypt your actual filesystem data, sector by sector,
-  every time you read or write to the unlocked volume. It is *not*
-  derived from your passphrase — it's generated once, from random
-  bytes, at `luksFormat` time, and never changes for the life of the
-  volume (unless you re-encrypt). Your passphrase's only job is to
-  unwrap (decrypt) a *copy* of this key stored in a keyslot — see
-  [`luks2-header-anatomy.md`](luks2-header-anatomy.md) for the full
-  unlock flow.
-- **Where it lives.** Never in cleartext on disk, anywhere. What's on
-  disk, per keyslot, is this key AF-split (the whole subject of this
-  document) and then encrypted under your passphrase-derived key (see
-  [What is written to disk](#what-is-written-to-disk)) — that's
-  the `area` region [`checking-for-corruption.md`](checking-for-corruption.md)
-  walks through inspecting. In cleartext, it exists in two different
-  places at two different points, each verified against the real
-  source rather than described in general terms:
-  - **Briefly, in `cryptsetup`'s own (userspace) heap memory**, only
-    during the unlock process itself. The unwrapped key is allocated
-    via `crypt_safe_alloc()`
-    ([`lib/utils_safe_memory.c`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/main/lib/utils_safe_memory.c),
-    verified 2026-08-17), which `mlock()`s the allocation (so it can't
-    be swapped to disk) and, on `crypt_safe_free()`, explicitly zeroes
-    it before calling `free()` — not a `memset` that a compiler could
-    optimize away, but `crypt_backend_memzero()`, meant to survive
-    that. This is heap memory, not stack, and not a CPU register — a
-    process with `ptrace` rights on the running `cryptsetup` process
-    (in practice, root, since `luksOpen` itself requires root) could
-    read it while it's live, the same as for any other process's
-    memory; nothing LUKS-specific defends against a *hostile root* on
-    the same machine, only against the key ending up on persistent
-    storage (swap) or lingering after use.
-  - **For as long as the volume stays mapped, inside the Linux
-    kernel's `dm-crypt` target** — a completely separate copy from
-    cryptsetup's, in kernel space rather than userspace. The kernel's
-    `struct crypt_config` (`drivers/md/dm-crypt.c`, confirmed against
-    the current Linux source, commit `8d3ae59288f1e7d58d76558a6ee96d533bc5019f`)
-    ends with `u8 key[] __counted_by(key_size);` — the raw key bytes
-    are allocated as part of this struct itself (`kzalloc_flex(*cc,
-    key, key_size)`), on the kernel heap, not the stack. It stays
-    there for the mapping's entire lifetime — this is *why* a mounted
-    LUKS volume keeps working without re-prompting for a passphrase on
-    every read/write: the kernel already has the key and uses it
-    directly, it doesn't ask userspace again. Reading kernel memory
-    from userspace isn't possible through ordinary means (no
-    `ptrace`-equivalent for kernel memory); it requires either a kernel
-    exploit, physical access with a hardware/DMA-based memory-dump
-    attack (a real, known LUKS/dm-crypt threat class, sometimes called
-    a "cold boot" or DMA attack — a fundamentally different threat
-    model from anything else in this project, since it requires an
-    already-unlocked, running machine rather than a disconnected drive;
-    see [`cold-boot-and-dma-attacks.md`](cold-boot-and-dma-attacks.md)
-    for the full treatment), or root abusing something like `/dev/kmem` where that's
-    even enabled (it's disabled by default on modern kernels). On
-    `cryptsetup luksClose` (which tears down the device-mapper
-    target), the kernel's own destructor, `crypt_dtr()`, explicitly
-    zeroes `struct crypt_config` before freeing it — the source
-    literally comments this step `/* Must zero key material before
-    freeing */` before calling `kfree_sensitive(cc)`, which zeroes
-    memory before the underlying `kfree()`. Until `luksClose` (or a
-    reboot/crash) happens, the key is genuinely still resident in
-    kernel memory — it does not get wiped just because you stop
-    actively reading/writing the volume.
-- **What it's used for, mechanically.** This is the same plaintext
-  master key from the first bullet above — already unwrapped from a
-  keyslot and confirmed correct by the digest check below — being put
-  to its actual use: encrypting and decrypting sectors, via a concrete
-  kernel object. Getting there, and then using it, breaks into three
-  distinct steps — object creation, one-time keying, and repeated use
-  — and keeping them separate is exactly what avoids the confusion
-  below about what happens "once" versus "constantly":
-  1. **The cipher object gets created, empty, at unlock time — before
-     the key is involved at all.** When a LUKS device is set up
-     (`luksOpen`), dm-crypt calls `crypt_alloc_tfms_skcipher()`, which
-     calls the kernel crypto API's `crypto_alloc_skcipher("aes-xts-plain64", ...)`
-     (or whatever cipher the volume was formatted with). This asks the
-     kernel to instantiate a real, working implementation of that
-     algorithm — a `struct crypto_skcipher` object, referred to in the
-     code as a `tfm` ("transform") — and the kernel picks a concrete
-     backend for it (a plain C implementation, or a
-     CPU-instruction-accelerated one like AES-NI, depending on what's
-     available; dm-crypt logs which one it picked via
-     `cra_driver_name`). At this point the `tfm` exists and knows *how*
-     to do AES-XTS, but has no key yet.
-  2. **Immediately after that empty `tfm` is created, dm-crypt calls
-     `crypt_setkey()`, which calls `crypto_skcipher_setkey(tfm, key,
-     size)` — the one function call, for the whole volume-mount
-     lifetime, that takes the raw plaintext key as an argument.** This
-     call expands the key into a *key schedule*: AES's own precomputed
-     set of per-round keys (14 rounds for AES-256, so 15 round keys),
-     specified as `KeyExpansion()` in [FIPS
-     197](https://doi.org/10.6028/NIST.FIPS.197-upd1) §5.2, p. 17
-     (Algorithm 2, quoted above). Per that algorithm, the schedule's
-     first `Nk` words are the raw key copied verbatim (`w[0..Nk-1] =
-     key`); every later round key is computed from there. The schedule
-     is stored inside the `tfm`, and every sector encrypt/decrypt in
-     step 3 reads it directly.
+Its length, *N* in this document, is the keyslot's `key_size` field.
+LUKS2 does not fix it: each keyslot records its own `key_size`, and
+"LUKS2 keyslots can store different keys with different key sizes"
+([LUKS2 spec v1.1.4](https://gitlab.com/cryptsetup/LUKS2-docs/-/blob/a81aa2fef8d176debdbec297c1e0b74bb50cfee8/luks2_doc_wip.pdf)
+§3.2, p.8, and §4.2, p.14). In practice it is set by the cipher chosen
+at `luksFormat` and by `--key-size`.
 
-     Which concrete function performs this expansion depends on which
-     backend the kernel picked for `xts(aes)` (`cra_driver_name`, step
-     1 above):
-     - **AES-NI** (the common case on x86): `xts_setkey_aesni()`
-       ([`arch/x86/crypto/aesni-intel_glue.c`](https://github.com/torvalds/linux/blob/ea0c746ffa1e6e701d39a564f6286a3f5740826b/arch/x86/crypto/aesni-intel_glue.c#L358-L376),
-       lines 358–376, pinned commit `ea0c746f`, verified 2026-08-20)
-       splits the 512-bit key in half and stores each half in its own
-       `struct crypto_aes_ctx`, inside `struct aesni_xts_ctx {
-       crypto_aes_ctx tweak_ctx; crypto_aes_ctx crypt_ctx; }` (same
-       file, lines 49–52). It does this via `aes_set_key_common()`
-       (lines 98–113), which normally runs the AES-NI assembly routine
-       `aesni_set_key()`, falling back to `aes_expandkey()` (declared
-       in
-       [`include/crypto/aes.h`](https://github.com/torvalds/linux/blob/d4e273a5065f81ca86eca48cb3fed55867cc0115/include/crypto/aes.h#L146-L160),
-       pinned commit `d4e273a5`, verified 2026-08-20; its own doc
-       comment: *"Expands the AES key as described in FIPS-197"*) when
-       SIMD isn't usable.
-     - **No hardware acceleration**: the generic `crypto/xts.c`
-       ([pinned commit `cae575fc`](https://github.com/torvalds/linux/blob/cae575fc09fa824900939960e33bc49b8e964d80/crypto/xts.c#L42-L74),
-       lines 42–74, verified 2026-08-20) template splits the key and
-       delegates to a child `ecb(aes)` transform, landing in
-       `crypto/aes.c`'s `crypto_aes_setkey()` → `aes_preparekey()` — a
-       different struct (`struct aes_key`, not `crypto_aes_ctx`), same
-       FIPS-197 expansion.
+### Why the default key is 512 bits
 
-     Freeing the `tfm` at `luksClose` zeroes this schedule.
-     `crypto_free_skcipher()`
-     ([`include/crypto/skcipher.h`](https://github.com/torvalds/linux/blob/f9bbd547cfb98b1c5e535aab9b0671a2ff22453a/include/crypto/skcipher.h#L328-L331),
-     lines 328–331, pinned commit `f9bbd547`, verified 2026-08-20) is
-     documented in its own comment as "zeroize and free cipher handle";
-     it calls `crypto_destroy_tfm()`
-     ([`crypto/api.c`](https://github.com/torvalds/linux/blob/cae575fc09fa824900939960e33bc49b8e964d80/crypto/api.c#L617-L631),
-     lines 617–631, same pinned commit as the generic xts.c above),
-     which calls `kfree_sensitive(mem)` — the same zero-before-free
-     primitive `crypt_dtr()` uses on `struct crypt_config` itself
-     (documented above). dm-crypt's teardown path calls
-     `crypto_free_skcipher()` on every `tfms[i]`, so on `luksClose` the
-     key material is zeroed twice: once when the `tfm` is freed, once
-     when `struct crypt_config` is freed. Before teardown, reading this
-     schedule requires the same access as reading the raw key
-     elsewhere in kernel memory (see "Where it lives," above): a
-     kernel exploit, a physical DMA/cold-boot attack, or root access
-     to `/dev/kmem` where enabled.
-  3. **Every sector read or write runs the cipher against that
-     schedule.** For each sector, dm-crypt allocates a fresh
-     per-request object (`crypt_alloc_req_skcipher()`), binds it to
-     the same, already-keyed `tfm` via `skcipher_request_set_tfm()`,
-     and calls `crypto_skcipher_encrypt()` or
-     `crypto_skcipher_decrypt()`. Neither function touches the
-     schedule directly: each pulls the `tfm` back off the request
-     (`crypto_skcipher_reqtfm(req)`) and dispatches to that backend's
-     registered encrypt/decrypt routine — on AES-NI,
-     `xts_encrypt_aesni()`/`xts_decrypt_aesni()`
-     (`arch/x86/crypto/aesni-intel_glue.c`, lines 592–593, same pinned
-     commit as above), which call down through `xts_crypt()` to
-     `aesni_xts_enc()`/`aesni_xts_dec()` (lines 490–501), the
-     assembly-implemented routines that actually take the
-     `crypto_aes_ctx` built in step 2 as an argument and read the
-     round keys out of it. That chain runs fresh for every sector,
-     over and over, for as long as the volume stays mounted, reading
-     the same schedule array — raw key at slot zero, derived round
-     keys after it — every time. Step 2's `setkey` call runs once per
-     unlock; step 3's use of what it produced runs continuously.
+With cryptsetup's default cipher, `aes-xts-plain64`, the key is 512
+bits, not the 256 bits "AES-256" suggests, because XTS takes two AES
+keys. One encrypts the data. The other encrypts each sector's IV to
+produce the *tweak*, a value that makes each 16-byte block's encryption
+depend on its position on the disk. The kernel's XTS template splits
+the key it is given exactly in half:
+[`crypto/xts.c`](https://github.com/torvalds/linux/blob/cae575fc09fa824900939960e33bc49b8e964d80/crypto/xts.c#L42-L75)'s
+`xts_setkey()` (lines 42–75) halves the key length and keys "two cipher
+instances: one to compute the initial 'tweak' by encrypting the IV
+(usually the 'plain' iv) and the other one to encrypt and decrypt the
+data" (comment, lines 56–58), with the tweak key taken from the second half (line 65).
+So a 512-bit XTS key is two independent 256-bit AES keys side by side,
+not one AES-256 key extended to 512 bits.
 
-  Confirmed directly in
-  [`drivers/md/dm-crypt.c`, pinned commit `43fd83c0`](https://github.com/torvalds/linux/blob/43fd83c0b1dc127cf13b4c05303665924e63ef94/drivers/md/dm-crypt.c)
-  (verified 2026-08-20): step 1's
-  [`crypt_alloc_tfms_skcipher()`](https://github.com/torvalds/linux/blob/43fd83c0b1dc127cf13b4c05303665924e63ef94/drivers/md/dm-crypt.c#L2297)
-  (line 2297) populates `cc->cipher_tfm.tfms[i]` via
-  `crypto_alloc_skcipher()`. Step 2's
-  [`crypt_setkey()`](https://github.com/torvalds/linux/blob/43fd83c0b1dc127cf13b4c05303665924e63ef94/drivers/md/dm-crypt.c#L2388-L2414)
-  (lines 2388–2414) loops over those same `tfms[i]` objects, calling
-  `crypto_skcipher_setkey(cc->cipher_tfm.tfms[i], cc->key + (i *
-  subkey_size), subkey_size)` (line 2414) for each one — and this exact
-  call is the *only* call to `crypto_skcipher_setkey()` in the entire
-  file, confirming it's genuinely a one-time step per unlock, not
-  something the per-sector path also does. Step 3 is a completely
-  separate code path:
-  [`crypt_alloc_req_skcipher()`](https://github.com/torvalds/linux/blob/43fd83c0b1dc127cf13b4c05303665924e63ef94/drivers/md/dm-crypt.c#L1431-L1442)
-  (lines 1431–1442) calls
-  `skcipher_request_set_tfm(ctx->r.req, cc->cipher_tfm.tfms[key_index])`
-  (line 1442), and
-  [`crypt_convert_block_skcipher()`](https://github.com/torvalds/linux/blob/43fd83c0b1dc127cf13b4c05303665924e63ef94/drivers/md/dm-crypt.c#L1352-L1418)
-  (lines 1352–1418) then calls
-  `crypto_skcipher_encrypt()`/`crypto_skcipher_decrypt()` (lines
-  1416/1418) — both run fresh for every sector, and neither one calls
-  `crypto_skcipher_setkey()`. (`crypto_skcipher_encrypt()` also appears
-  once more, at line 754, inside a self-test helper used to validate a
-  cipher choice before committing to it — unrelated to the per-sector
-  I/O path.)
-  `crypt_setkey()` does run again later, but only if the key is
-  explicitly replaced: `crypt_wipe_key()` (covered in
-  [`cold-boot-and-dma-attacks.md`](cold-boot-and-dma-attacks.md)) calls
-  it to load fresh random bytes into the same, already-existing `tfm`
-  objects in place of the real key, destroying the old schedule.
+The two halves must differ. The FIPS 140 implementation guidance
+explains why: if Key_1 = Key_2, "an adversary who does not know the
+key may be able to manipulate the ciphertext in that sector so that one
+or more plaintext blocks change to any desired value"
+([FIPS 140-2 IG](https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Module-Validation-Program/documents/fips140-2/FIPS1402IG.pdf)
+§A.9 "XTS-AES Key Generation Requirements", p.213; the same text is
+§C.I "XTS-AES (SP 800-38E) Requirements on the Key" of the
+[FIPS 140-3 IG](https://csrc.nist.gov/csrc/media/Projects/cryptographic-module-validation-program/documents/fips%20140-3/FIPS%20140-3%20IG.pdf),
+p.156, version dated 08/19/2026). Both cite §6 of Rogaway's
+[*Efficient Instantiations of Tweakable Blockciphers and Refinements
+to Modes OCB and PMAC*](https://www.cs.ucdavis.edu/~rogaway/papers/offsets.pdf)
+(2004), which gives the attack for the single-key construction. NIST
+SP 800-38E, which approves XTS-AES, does so by reference to IEEE
+1619-2007 and does not discuss this itself.
 
-  `aes-xts-plain64` is cryptsetup's default cipher for this step; that's
-  it, there's no other role for this key anywhere in LUKS2.
+The kernel only enforces it in some configurations.
+`xts_verify_key()` rejects equal halves only "when in FIPS mode or the
+FORBID_WEAK_KEYS flag is set"
+([`include/crypto/xts.h`](https://github.com/torvalds/linux/blob/cae575fc09fa824900939960e33bc49b8e964d80/include/crypto/xts.h#L28-L35),
+lines 28–35), and dm-crypt does not set that flag (it does not appear
+in [`drivers/md/dm-crypt.c`](https://github.com/torvalds/linux/blob/43fd83c0b1dc127cf13b4c05303665924e63ef94/drivers/md/dm-crypt.c)).
+cryptsetup generates the key from random bytes, so equal halves are
+not a practical concern for keys it creates.
 
-  #### Key-lifecycle call graph
+### Where the key length comes from, per code
 
-  The three-step summary above collapses real branching: which exact
-  functions run depends on which of three competing kernel
-  implementations of `xts(aes)` wins priority-based selection, and the
-  per-sector encrypt/decrypt path is driven by a bio-submission chain
-  never shown above. The diagram below traces every edge from
-  `luksOpen` through per-sector I/O to `luksClose`, each one verified
-  against real kernel source at a pinned commit (see the citation
-  table beneath it). This covers only the key lifecycle; separate
-  diagrams for tweak/IV generation and the full userspace-to-kernel
-  unlock path are planned but not yet built — don't read anything
-  below as covering those.
+Three layers decide the key length:
 
-  ```mermaid
-  flowchart TD
-      subgraph S1["1. tfm creation (luksOpen)"]
-          A1["crypt_alloc_tfms_skcipher()<br/>dm-crypt.c:2297"]
-          A2["crypto_alloc_skcipher('aes-xts-plain64', ...)<br/>picks highest-priority registered xts(aes)"]
-          A1 --> A2
-      end
-
-      subgraph S2["2. Backend selection (crypto API priority)"]
-          B1["xts-aes-aesni<br/>priority 401<br/>aesni-intel_glue.c:580-593"]
-          B2["xts-aes-lib<br/>priority 110<br/>crypto/aes.c:691-704"]
-          B3["xts(ecb(aes))<br/>template composition, inherited priority<br/>crypto/xts.c + crypto/ecb.c<br/>legacy path, unverified reachability"]
-          A2 -.->|AES-NI available| B1
-          A2 -.->|no AES-NI, lib compiled in<br/>always true in practice| B2
-          A2 -.->|structurally exists; whether it can<br/>still be selected is unverified| B3
-      end
-
-      subgraph S3["3. Keying — crypt_setkey() / crypto_skcipher_setkey(tfm,key,size)<br/>dm-crypt.c:2388-2414, called exactly once per unlock"]
-          C1["xts_setkey_aesni()<br/>aesni-intel_glue.c:358-376"]
-          C2["aes_set_key_common()<br/>aesni-intel_glue.c:98-113"]
-          C3a["aesni_set_key() [asm]<br/>SIMD usable"]
-          C3b["aes_expandkey()<br/>include/crypto/aes.h:146-160<br/>SIMD NOT usable"]
-          C4["struct crypto_aes_ctx<br/>(key_enc[], key_dec[], key_length)<br/>aes.h:122-126<br/>inside struct aesni_xts_ctx<br/>aesni-intel_glue.c:49-52"]
-
-          C5["crypto_aes_xts_setkey()<br/>crypto/aes.c:514-525"]
-          C6["aes_xts_preparekey()<br/>lib/crypto/aes.c:1206-1229"]
-          C7["struct aes_xts_key<br/>include/crypto/aes-xts.h"]
-
-          C8["xts_setkey() [generic template]<br/>crypto/xts.c:42-75"]
-          C9["child ecb(aes) skcipher_setkey()<br/>lskcipher adaptation shim — NOT verified"]
-          C10["crypto_aes_setkey()<br/>crypto/aes.c ~34-40"]
-          C11["aes_preparekey()<br/>include/crypto/aes.h:335<br/>struct aes_key"]
-
-          B1 --> C1 --> C2
-          C2 -->|SIMD usable| C3a --> C4
-          C2 -->|SIMD unusable| C3b --> C4
-
-          B2 --> C5 --> C6 --> C7
-
-          B3 --> C8 --> C9 --> C10 --> C11
-      end
-
-      subgraph S4["4. Bio entry & dispatch (per I/O request)"]
-          D1["device-mapper core<br/>invokes target's .map"]
-          D2["crypt_map()<br/>dm-crypt.c:3417-3496"]
-          D3["kcryptd_queue_crypt()<br/>dm-crypt.c:2233-2256<br/>WRITE path"]
-          D4["kcryptd_io_read() /<br/>kcryptd_queue_read()<br/>READ path, ciphertext fetch"]
-          D5["kcryptd_crypt()<br/>dm-crypt.c:2223-2231<br/>workqueue callback"]
-          D6["kcryptd_crypt_write_convert()<br/>dm-crypt.c:2041-2098"]
-          D7["kcryptd_crypt_read_convert()<br/>dm-crypt.c:2122-2146"]
-          D8["crypt_convert()<br/>dm-crypt.c:1515-1544"]
-          D9["crypt_alloc_req()<br/>dm-crypt.c:1477-1484"]
-          D10["crypt_alloc_req_skcipher()<br/>dm-crypt.c:1431-1442<br/>skcipher_request_set_tfm() binds<br/>request to already-keyed tfm"]
-          D11["crypt_convert_block_skcipher()<br/>dm-crypt.c:1352-1418"]
-          D12["crypto_skcipher_encrypt() /<br/>crypto_skcipher_decrypt()<br/>dm-crypt.c:1416/1418<br/>skcipher.c: pulls tfm off request,<br/>dispatches to alg-&gt;encrypt/decrypt"]
-
-          D1 --> D2
-          D2 -->|WRITE| D3 --> D5
-          D2 -->|READ| D4 --> D5
-          D5 -->|WRITE| D6 --> D8
-          D5 -->|READ| D7 --> D8
-          D8 --> D9 --> D10
-          D8 --> D11 --> D12
-      end
-
-      subgraph S5["5. Per-sector encrypt/decrypt (runs continuously, once per sector)"]
-          E1a["xts_encrypt_aesni() / xts_decrypt_aesni()<br/>aesni-intel_glue.c:592-593"]
-          E1b["xts_crypt()<br/>aesni-intel_glue.c:452-480"]
-          E1c["aesni_xts_encrypt() / aesni_xts_decrypt()<br/>aesni-intel_glue.c:490-501"]
-          E1d["aesni_xts_enc() / aesni_xts_dec() [asm]<br/>reads struct crypto_aes_ctx directly"]
-
-          E2a["crypto_aes_xts_encrypt() / crypto_aes_xts_decrypt()<br/>crypto/aes.c:576-603"]
-          E2b["aes_xts_encrypt() / aes_xts_decrypt()<br/>lib/crypto/aes.c:1401-1431"]
-          E2c["aes_xts_encrypt_nocts() / _decrypt_nocts()<br/>lib/crypto/aes.c:1285-1318"]
-          E2d["aes_xts_encrypt_arch() / _decrypt_arch()<br/>weak hooks, no x86 override found<br/>lib/crypto/aes.c:1241-1256"]
-          E2e["aes_xts_crypt_nocts_blockbyblock()<br/>lib/crypto/aes.c:1258-1282"]
-          E2f["aes_encrypt() / aes_decrypt()<br/>lib/crypto/aes.c:511-523<br/>reads struct aes_xts_key"]
-
-          E3a["xts_encrypt() / xts_decrypt() [template]<br/>crypto/xts.c:262-294"]
-          E3b["child ecb(aes) encrypt/decrypt<br/>crypto/ecb.c:16-54"]
-          E3c["crypto_aes_encrypt() / crypto_aes_decrypt()<br/>crypto/aes.c ~41-47"]
-
-          D12 -->|AES-NI backend| E1a --> E1b --> E1c --> E1d
-          D12 -->|xts-aes-lib backend, fast/linear path| E2a --> E2b
-          E2a -->|nonlinear/HIGHMEM| E2c
-          E2b --> E2c --> E2d
-          E2d -->|falls through, no arch override| E2e --> E2f
-          D12 -->|xts-ecb-aes backend, unverified reachability| E3a --> E3b --> E3c --> E2f
-      end
-
-      subgraph S6["6. Teardown (luksClose)"]
-          F1["crypt_dtr()"]
-          F2["kfree_sensitive(cc)<br/>zeroes struct crypt_config<br/>source comment: 'Must zero key material before freeing'"]
-          F3["crypt_free_tfms_skcipher()<br/>loops every tfms[i]"]
-          F4["crypto_free_skcipher()<br/>skcipher.h:328-331<br/>doc comment: 'zeroize and free cipher handle'"]
-          F5["crypto_destroy_tfm()<br/>api.c:617-631"]
-          F6["kfree_sensitive(mem)<br/>zeroes tfm context —<br/>including whichever key<br/>schedule struct from step 3"]
-
-          F1 --> F2
-          F1 --> F3 --> F4 --> F5 --> F6
-      end
-
-      C4 -.-> D10
-      C7 -.-> D10
-      C4 -.-> F6
-      C7 -.-> F6
-
-      classDef unverified fill:#fff3cd,stroke:#997404,color:#664d03
-      class B3,C9,E3a,E3b,E3c unverified
-  ```
-
-  Amber nodes are structurally confirmed to exist in source but have
-  at least one unverified edge — most importantly, the `lskcipher`-to-
-  `skcipher` adaptation shim that lets `crypto/xts.c`'s generic
-  template obtain a handle to `ecb(aes)`, which `crypto/ecb.c` has
-  registered as an `lskcipher`, not a `skcipher`, since Linux v6.7
-  ([`32a8dc4a`](https://github.com/torvalds/linux/commit/32a8dc4afcfb098ef4e8b465c90db17d22d90107),
-  `crypto: ecb - Convert from skcipher to lskcipher`). Do not treat
-  amber nodes as fully verified the way the rest of the graph is.
-
-  **The single biggest finding from building this diagram**: an
-  earlier version of this doc cited `crypto_aes_expand_key()` in
-  `crypto/aes_generic.c` as the AES key-schedule routine. That
-  function was real but long outdated. Linux v5.4 replaced it with the
-  shared library routine `aes_expandkey()` in `lib/crypto/aes.c`
-  ([`5bb12d78`](https://github.com/torvalds/linux/commit/5bb12d7825adf0e80b849a273834f3131a6cc4e1),
-  `crypto: aes-generic - drop key expansion routine in favor of
-  library version`), and v7.0 deleted `crypto/aes_generic.c`,
-  replacing it with `crypto/aes.c`, a Crypto API wrapper around that
-  library
-  ([`a2484474`](https://github.com/torvalds/linux/commit/a2484474272ef98d9580d8c610b0f7c6ed2f146c),
-  `crypto: aes - Replace aes-generic with wrapper around lib`). At
-  this diagram's pinned commits, all of which are part of the v7.3
-  release, `xts(aes)` is registered **three
-  separate times**: AES-NI's `xts-aes-aesni`; the library-backed
-  `xts-aes-lib`, which v7.3 added to `crypto/aes.c`
-  ([`94efa0c9`](https://github.com/torvalds/linux/commit/94efa0c9fb36b0f8be480f24bce2bb673005bfde),
-  `crypto: aes - Add XTS support using library`); and the generic
-  `xts` template over `ecb(aes)`. `crypto_alloc_skcipher()` picks the
-  highest `cra_priority` available, so the diagram's
-  Setup/Keying/Encrypt-Decrypt layers all branch three ways, not two.
-  Unreleased kernel master has since moved x86's AES-NI XTS code into
-  the library
-  ([`2bd68888`](https://github.com/torvalds/linux/commit/2bd6888849d6d2d5497c2470cc71c8d2cb170523))
-  and raised `xts-aes-lib`'s x86 priority to 500
-  ([`f410daa3`](https://github.com/torvalds/linux/commit/f410daa32cfcd94263f156662a1ad2097505443c));
-  this diagram does not reflect that yet.
-
-  **Citations** (all fetched and line-checked directly against the
-  pinned commit shown, verified 2026-08-20):
-
-  | File | Pinned commit |
-  |---|---|
-  | `drivers/md/dm-crypt.c` | [`43fd83c0`](https://github.com/torvalds/linux/tree/43fd83c0b1dc127cf13b4c05303665924e63ef94/drivers/md/dm-crypt.c) |
-  | `arch/x86/crypto/aesni-intel_glue.c` | [`ea0c746f`](https://github.com/torvalds/linux/tree/ea0c746ffa1e6e701d39a564f6286a3f5740826b/arch/x86/crypto/aesni-intel_glue.c) |
-  | `include/crypto/aes.h` | [`d4e273a5`](https://github.com/torvalds/linux/tree/d4e273a5065f81ca86eca48cb3fed55867cc0115/include/crypto/aes.h) |
-  | `crypto/aes.c` | [`f70ad727`](https://github.com/torvalds/linux/tree/f70ad727d1d60a4dfcb1a22152d4169f9a205af9/crypto/aes.c) |
-  | `lib/crypto/aes.c` | [`561131a2`](https://github.com/torvalds/linux/tree/561131a27f5533e6e63520b4bc43d9c832a27c09/lib/crypto/aes.c) |
-  | `crypto/xts.c` | [`cae575fc`](https://github.com/torvalds/linux/tree/cae575fc09fa824900939960e33bc49b8e964d80/crypto/xts.c) |
-  | `crypto/ecb.c` | [`ef93f156`](https://github.com/torvalds/linux/tree/ef93f1562803cd7bb8159e3abedaf7f47dce4e35/crypto/ecb.c) |
-  | `include/crypto/skcipher.h` | [`f9bbd547`](https://github.com/torvalds/linux/tree/f9bbd547cfb98b1c5e535aab9b0671a2ff22453a/include/crypto/skcipher.h) |
-  | `crypto/api.c` | [`cae575fc`](https://github.com/torvalds/linux/tree/cae575fc09fa824900939960e33bc49b8e964d80/crypto/api.c) |
-
-  A themed, browsable version of this same diagram — same Mermaid
-  source, same citation table — is checked into this repo at
-  [`docs/diagrams/key-lifecycle.html`](diagrams/key-lifecycle.html);
-  open it directly in a browser (it loads Mermaid and its Google Fonts
-  from a CDN, so it needs a network connection once, but has no other
-  dependency).
-
-- **How LUKS2 knows the unwrap actually worked.** Decrypting a keyslot
-  with the *wrong* passphrase doesn't fail loudly — symmetric
-  decryption with the wrong key just produces wrong-looking bytes, not
-  an error. So unwrapping alone can't tell you whether you got the real
-  key back. LUKS2 solves this with a separate check: at `luksFormat`
-  time, the real master key is run through PBKDF2 once (independently
-  of the passphrase KDF) with a stored salt, and the result is saved in
-  cleartext as a `digest` in the header's JSON metadata. After
-  unwrapping a candidate key from any keyslot, cryptsetup repeats that
-  same PBKDF2 computation on the candidate and compares it, byte for
-  byte, against the stored digest — confirmed directly in
-  `PBKDF2_digest_verify()`
-  ([`lib/luks2/luks2_digest_pbkdf2.c`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/main/lib/luks2/luks2_digest_pbkdf2.c),
-  verified 2026-08-17). Match means the passphrase was right; mismatch
-  means it wasn't — and this check happens *before* cryptsetup ever
-  touches your actual encrypted data, which is exactly what
-  `cryptsetup open --test-passphrase` relies on to verify a guess
-  safely without mounting anything (see
-  [`passphrase-recovery.md`](passphrase-recovery.md)).
-
-With that grounded, the actual question this aside answers: **why is
-this key 512 bits by default**, when "AES-256" (256 bits) is the number
-most people would guess? Short answer: `aes-xts-plain64`'s "XTS" part
-needs two separate 256-bit AES keys, not one — one key encrypts your
-actual data, the other encrypts a small per-sector value (a "tweak")
-that keeps two sectors holding identical plaintext from producing
-identical ciphertext. Both keys are required and independent; there is
-no single, smaller "real" key underneath that gets padded or doubled
-after the fact — the 512-bit value *is* the two keys, concatenated.
-
-That two-key requirement is confirmed directly in the Linux kernel code
-dm-crypt actually calls at unlock time (`crypto/xts.c`,
-`xts_setkey()`), which splits an incoming key exactly in half and
-explicitly rejects it if the two halves are equal:
-
-```c
-static int xts_setkey(struct crypto_skcipher *parent, const u8 *key,
-		      unsigned int keylen)
-{
-	...
-	err = xts_verify_key(parent, key, keylen);
-	if (err)
-		return err;
-
-	keylen /= 2;
-
-	/* we need two cipher instances: one to compute the initial 'tweak'
-	 * by encrypting the IV (usually the 'plain' iv) and the other
-	 * to encrypt the data */
-	...
-```
-([`crypto/xts.c` on kernel.org's git mirror](https://github.com/torvalds/linux/blob/master/crypto/xts.c),
-verified 2026-08-16.) That rejection isn't defensive paranoia — using
-the same key for both halves is a real, documented, exploitable
-weakness (a chosen-ciphertext attack letting an adversary tamper with
-plaintext without knowing the key), specified in [FIPS 140-2
-Implementation Guidance, §A.9 "XTS-AES Key Generation
-Requirements"](https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Module-Validation-Program/documents/fips140-2/FIPS1402IG.pdf)
-(p. 213; §C.I in the newer [FIPS 140-3
-IG](https://csrc.nist.gov/csrc/media/Projects/cryptographic-module-validation-program/documents/fips%20140-3/FIPS%20140-3%20IG.pdf),
-p. 141), citing Rogaway's *Efficient Instantiations of Tweakable
-Blockciphers and Refinements to Modes OCB and PMAC* (2004), §6.
-(NIST SP 800-38E, sometimes cited for this, actually has no
-security-rationale section on it — just a bibliography — so the FIPS IG
-is the real source, not that spec.)
-
-**Why cryptsetup's own code describes this as "doubling."** cryptsetup
-has exactly one compiled-in default key size, 256 bits, meant for
-ordinary single-key ciphers like `aes-cbc-essiv:sha256`. Rather than
-maintaining a second default for XTS, it reuses that same 256-bit
-number and multiplies it by two specifically when the chosen cipher
-mode is XTS — arriving at 512 bits before any key material is
-generated. cryptsetup's build configuration names this literally:
-`configure.ac`'s `--disable-luks-adjust-xts-keysize` option and its
-`ENABLE_LUKS_ADJUST_XTS_KEYSIZE` macro are both documented in the
-source as *"XTS mode requires two keys, double default LUKS keysize if
-needed."* The exact code doing this arithmetic is in the next section
-([Where key length actually comes from, per code](#where-key-length-actually-comes-from-per-code)) —
-flagging the word "doubling" here so it's read correctly: it's
-cryptsetup's default-selection *code* doubling a shared constant, not a
-smaller 256-bit key getting padded out into 512 bits after generation.
-
-None of this is a fixed rule, though — it's just cryptsetup's default
-when you don't pass `--key-size`. 32 bytes (256-bit, a single key, no
-doubling) is also a real, common value — it's the exact figure the
-LUKS2 spec's own worked example uses, for a cipher mode that only needs
-one key. This document uses 32 bytes for its worked example purely
-because it's a familiar round number; nothing below depends on that
-specific length.
-
-#### Where key length actually comes from, per code
-
-There are three separate layers here, and conflating them produces
-exactly the kind of "32 bytes is standard" overstatement this section
-just corrected. Each layer's actual behavior, cited directly:
-
-1. **LUKS2 on-disk format**: imposes no fixed key length. Each keyslot's
-   JSON metadata carries its own `key_size` (bytes) field, and different
-   keyslots on the same volume are explicitly allowed to hold
-   different-sized keys (LUKS2 On-Disk Format Specification v1.1.4,
-   [`docs/on-disk-format-luks2.pdf`](https://gitlab.com/cryptsetup/cryptsetup/-/raw/main/docs/on-disk-format-luks2.pdf),
-   §3.2/§4.2). The format's only real constraint is an upper storage
-   bound (`LUKS_MAX_KEYSLOT_SIZE` in `lib/luks1/luks.h`), not a specific
-   length.
-2. **Kernel / dm-crypt**: cryptsetup does not hardcode a table of
-   "cipher X accepts key sizes Y" — the man page says so outright
-   (`man/cryptsetup.8.adoc`, "Supported ciphers, modes, hashes and key
-   sizes" section): *"The available combinations of ciphers, modes,
-   hashes and key sizes depend on kernel support. See /proc/crypto for a
-   list of available options."* Concretely, `crypt_check_cipher()`
-   (`lib/utils.c`) doesn't consult a lookup table at all — it generates
-   a random key of the requested length and actually attempts the
-   cipher via `crypt_storage_init()`/`crypt_storage_decrypt()`, and
-   rejects `luksFormat` only if that live attempt fails. The kernel
-   crypto API is the real source of truth, not cryptsetup.
-3. **cryptsetup's CLI convenience default**: the *only* place a
-   specific number gets chosen automatically is when you run
-   `luksFormat` without `--key-size`. That path is
-   `get_adjusted_key_size()` in `src/utils_luks.c`:
+1. **The LUKS2 format** records it per keyslot and fixes no value (see
+   above).
+2. **Cipher support** decides which lengths work. cryptsetup keeps no
+   table of valid key sizes; its man page says "The available
+   combinations of ciphers, modes, hashes and key sizes depend on
+   kernel support" and "the configured cryptographic library must also
+   support selected algorithms"
+   ([`man/cryptsetup.8.adoc`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/bae21790d59897ac50e5471f953f76b3a58aeeb6/man/cryptsetup.8.adoc),
+   lines 538–542). When formatting, `crypt_check_cipher()`
+   ([`lib/utils.c`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/bae21790d59897ac50e5471f953f76b3a58aeeb6/lib/utils.c#L388-453),
+   lines 388–453) tests the cipher with a random key of the requested
+   length: first through cryptsetup's own crypto backend
+   (`crypt_storage_init()` and `crypt_storage_decrypt()`), and, if that
+   fails and cryptsetup runs as root, through the kernel's dm-crypt
+   (`crypt_storage_wrapper_init()` with `CSW_DMCRYPT_ONLY`). The format
+   fails only if the cipher works neither way.
+3. **cryptsetup's default** picks a length when `luksFormat` runs
+   without `--key-size`, in `get_adjusted_key_size()`
+   ([`src/utils_luks.c`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/bae21790d59897ac50e5471f953f76b3a58aeeb6/src/utils_luks.c#L142-154),
+   lines 142–154):
 
    ```c
    int get_adjusted_key_size(const char *cipher, const char *cipher_mode, uint32_t keysize_bits,
-                 uint32_t default_size_bits, int integrity_keysize)
+   			  uint32_t default_size_bits, int integrity_keysize)
    {
    #if ENABLE_LUKS_ADJUST_XTS_KEYSIZE
-       if (!keysize_bits && (!strncmp(cipher_mode, "xts-", 4) || !strncmp(cipher, "capi:xts(", 9))) {
-           if (default_size_bits == 128)
-               keysize_bits = 256;
-           else if (default_size_bits == 256)
-               keysize_bits = 512;
-       }
+   	if (!keysize_bits && (!strncmp(cipher_mode, "xts-", 4) || !strncmp(cipher, "capi:xts(", 9))) {
+   		if (default_size_bits == 128)
+   			keysize_bits = 256;
+   		else if (default_size_bits == 256)
+   			keysize_bits = 512;
+   	}
    #endif
-       return (keysize_bits ?: default_size_bits) / 8 + integrity_keysize;
+   	return (keysize_bits ?: default_size_bits) / 8 + integrity_keysize;
    }
    ```
 
-   In words: only fires if you didn't pass `--key-size` (`!keysize_bits`)
-   *and* the mode string literally starts with `"xts-"` (or is a
-   `capi:xts(...)` spec) — then it doubles the compiled-in
-   `default_size_bits` (256 → 512 bits). Any other mode (`cbc-essiv:...`,
-   `adiantum-plain64`, etc.) skips this branch entirely and just uses
-   `default_size_bits` (256 bits / 32 bytes) as-is. Source:
-   [`src/utils_luks.c`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/9b560a0d4948cde06a1a961813ee3c01264a185f/src/utils_luks.c#L141-150)
-   (pinned commit `9b560a0d`, verified 2026-08-16).
+   If no `--key-size` was given and the mode starts with `xts-` (or the
+   cipher is a `capi:xts(...)` spec), it doubles the compiled-in
+   default of 256 bits to 512; otherwise it uses 256 bits. The doubling
+   is a build option: `configure.ac` describes
+   `--disable-luks-adjust-xts-keysize` as "XTS mode requires two keys,
+   double default LUKS keysize if needed", and enables it by default
+   ([`configure.ac`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/bae21790d59897ac50e5471f953f76b3a58aeeb6/configure.ac#L794-803),
+   lines 794–803, which also set the default cipher `aes`, mode
+   `xts-plain64` and key size 256).
 
-Concretely, for common `--cipher` choices with no explicit
-`--key-size`:
+The resulting key sizes, measured with cryptsetup 2.8.8 by formatting
+a throwaway image with each cipher and no `--key-size`
+([`experiments/default-key-sizes/`](../experiments/default-key-sizes)):
 
-| `--cipher` value | Mode matches `xts-`? | Doubling applies? | Resulting key |
-|---|---|---|---|
-| `aes-xts-plain64` (the default) | yes | yes | 512 bit / 64 bytes |
-| `serpent-xts-plain64` | yes | yes | 512 bit / 64 bytes |
-| `twofish-xts-plain64` | yes | yes | 512 bit / 64 bytes |
-| `aes-cbc-essiv:sha256` | no | no | 256 bit / 32 bytes |
-| `aes-adiantum-plain64` | no (mode is `adiantum`, not `xts-...`) | no | 256 bit / 32 bytes |
+| `--cipher` | Mode starts with `xts-`? | Key size |
+|---|---|---|
+| `aes-xts-plain64` (the default) | yes | 512 bits / 64 bytes |
+| `serpent-xts-plain64` | yes | 512 bits / 64 bytes |
+| `twofish-xts-plain64` | yes | 512 bits / 64 bytes |
+| `aes-cbc-essiv:sha256` | no | 256 bits / 32 bytes |
+| `xchacha20,aes-adiantum-plain64` | no | 256 bits / 32 bytes |
 
-All five rows assume the compiled-in `default_size_bits` of 256 was left
-untouched at build time — this table describes the *default-selection*
-logic, not a hard limit; `--key-size` overrides it for any cipher, and
-whatever value results still has to pass the live
-`crypt_check_cipher()` test against the running kernel.
+In every case the keyslot area used the same cipher and key size as
+the volume. `--key-size` overrides the default for any cipher, as long
+as the result passes `crypt_check_cipher()`.
 
-#### The keyslot JSON object, sketched
+### The keyslot JSON object, sketched
 
-`key_size` doesn't float free in the JSON — it's one field inside a
-specific nested structure. Every field below is mandatory unless marked
-`optional`; this is the `luks2`-type keyslot object shape (source: LUKS2
-On-Disk Format Specification v1.1.4, §3.2–3.2.5, same PDF as above):
+`key_size` is one field of a keyslot object in the header's JSON
+metadata. The shape of a keyslot of type `luks2`, from the LUKS2
+specification (§3.2–3.2.5, pp.8–10); every field is mandatory unless
+marked optional:
 
 ```
 keyslots["<N>"]                         <- keyslot, keyed by slot number as a string
 ├── type            "luks2"
-├── key_size        <int, bytes>        <- the field this document keeps citing
-├── priority        <int, optional>     <- 0=ignore, 1=normal, 2=high
-├── af { }                              <- anti-forensic splitting parameters
-│   ├── type        "luks1"             <- only luks1-style AF is currently used
-│   ├── stripes     <int>               <- only 4000 is supported ("historical reasons")
+├── key_size        <int, bytes>        <- the size of the key stored in the keyslot
+├── priority        <int, optional>     <- 0 = ignore, 1 = normal, 2 = high
+├── af { }                              <- anti-forensic splitter
+│   ├── type        "luks1"             <- the only AF type currently used
+│   ├── stripes     <int>               <- only 4000 is supported
 │   └── hash        <string>            <- diffuse()'s hash, e.g. "sha256"
-├── area { }                            <- where the AF-striped data physically lives
-│   ├── type        "raw"               <- only "raw" is valid for luks2 keyslots
-│   ├── offset      <string-uint64>     <- byte offset from device start
-│   ├── size        <string-uint64>     <- this is what inspect-keyslot's "Area length" is
-│   ├── encryption  <string>            <- dm-crypt cipher spec, e.g. "aes-xts-plain64"
-│   └── key_size    <int, bytes>        <- area-encryption key size (normally == keyslot key_size)
-└── kdf { }                             <- how your passphrase becomes the area-encryption key
+├── area { }                            <- where the encrypted split key is stored
+│   ├── type        "raw"               <- the only area type for luks2 keyslots
+│   ├── offset      <string-uint64>     <- byte offset from the device start
+│   ├── size        <string-uint64>     <- area size; inspect-keyslot's "Area length"
+│   ├── encryption  <string>            <- area cipher, e.g. "aes-xts-plain64"
+│   └── key_size    <int, bytes>        <- area cipher's key size
+└── kdf { }                             <- turns the passphrase into the area key
     ├── type        "argon2i" | "argon2id" | "pbkdf2"
     ├── salt        <base64>
     ├── time        <int>               <- argon2 only
-    ├── memory      <int, KB>           <- argon2 only
+    ├── memory      <int, kilobytes>    <- argon2 only
     ├── cpus        <int>               <- argon2 only
     ├── hash        <string>            <- pbkdf2 only
     └── iterations  <int>               <- pbkdf2 only
 ```
 
-Two `key_size` fields exist at different nesting depths (top-level
-`keyslots["N"].key_size` and `keyslots["N"].area.key_size`) — the spec
-describes them as normally equal, but they're formally separate fields:
-one is "the key size stored in keyslot," the other is "the area
-encryption key size." Cross-checked against actual field validation in
-cryptsetup source, `LUKS2_keyslot_validate()` in
-[`lib/luks2/luks2_json_metadata.c`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/main/lib/luks2/luks2_json_metadata.c)
-requires `key_size` (as `json_type_int`) directly on every keyslot
-object, and separately requires the nested `area` object to exist —
-matching the spec's mandatory-fields list above, not just documented
-prose.
+The two `key_size` fields are separate: `keyslots["N"].key_size` is
+"the key size (in bytes) stored in keyslot" (§3.2, p.8), the master
+key's size, and `area.key_size` is "the area encryption key size"
+(§3.2.3, p.9), the size of the passphrase-derived key that encrypts the
+area. They are equal when the area uses the volume's cipher, which
+cryptsetup does whenever it can (see
+[What is written to disk](#what-is-written-to-disk)).
 
-#### A real example, from the spec itself
+cryptsetup checks this shape in two places. `LUKS2_keyslot_validate()`
+requires every keyslot to have a string `type` and an integer
+`key_size` that fits in 32 bits
+([`lib/luks2/luks2_json_metadata.c`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/bae21790d59897ac50e5471f953f76b3a58aeeb6/lib/luks2/luks2_json_metadata.c#L418-435),
+lines 418–435). The `luks2` keyslot type's own validator,
+`luks2_keyslot_validate()`, requires the `kdf`, `af` and `area` objects
+and the fields of each
+([`lib/luks2/luks2_keyslot_luks2.c`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/bae21790d59897ac50e5471f953f76b3a58aeeb6/lib/luks2/luks2_keyslot_luks2.c#L668-732),
+lines 668–732); it checks that `af.stripes` is an integer, not that it
+is 4000.
 
-This isn't a hand-built illustration — it's the LUKS2 On-Disk Format
-Specification's own worked example (§3.1, full header for an
-AES-XTS-encrypted device with two keyslots), quoted verbatim except for
-re-indentation:
+### A real example, from the spec itself
+
+The LUKS2 specification's own example (§3.1, p.7), the full metadata of
+an AES-XTS device with two keyslots, quoted here except for spacing and
+with only the `keyslots` object:
 
 ```json
 {
@@ -778,23 +361,17 @@ re-indentation:
 }
 ```
 
-(The full spec example also includes `tokens`, `segments`, `digests`,
-and `config` top-level objects — trimmed here to just `keyslots` since
-that's this document's subject. See
-[`luks2-header-anatomy.md#the-json-metadata-area`](luks2-header-anatomy.md#the-json-metadata-area)
-for the other top-level objects.)
+The full example also has `tokens`, `segments`, `digests` and `config`
+objects; see
+[`luks2-header-anatomy.md#the-json-metadata-area`](luks2-header-anatomy.md#the-json-metadata-area).
 
-Notice this example's two keyslots use **different KDF types** (slot 0:
-`argon2i`; slot 1: `pbkdf2`) but the **same `key_size`: 32** — this is
-exactly the "different keyslots can use different parameters, but
-happen to share a key length here" case, not evidence that 32 is fixed.
-Change `--cipher` to something in the "doubling applies" rows of the
-table above and both `key_size` fields (top-level and `area.key_size`)
-would read `64` instead, with no other structural change.
+The two keyslots use different KDFs (`argon2i` and `pbkdf2`) and the
+same `key_size`, 32. With `aes-xts-plain64`, 32 bytes means two 16-byte
+AES-128 keys; cryptsetup's current default for this cipher is 64 bytes
+(see the table above). Each area
+is 131,072 bytes, enough for the 4000 × 32 = 128,000 bytes of split
+material.
 
-That's the full answer to "what is *N*": it's `key_size` from a real
-keyslot, and it's commonly 32 or 64 bytes depending on cipher choice —
-32 being both the spec's own example value and a familiar round number.
 The algorithm is the same for both sizes. What the size changes is how
 damage spreads: `diffuse()` hashes the key-sized accumulator in 32-byte
 chunks (with SHA-256), so a 32-byte key is one chunk and a 64-byte key
@@ -1095,7 +672,7 @@ encrypted split material, 500 sectors.
 Unlocking reverses this: derive the key from the passphrase, read and
 decrypt the same number of bytes from `area.offset`, `AF_merge()` them
 (lines 315–360), then check the result against the stored digest (see
-[How LUKS2 knows the unwrap actually worked](#aside-where-does-that-key-length-number-actually-come-from)).
+[How a wrong key is detected](#how-a-wrong-key-is-detected)).
 Unlocking does not read `af.stripes` from the header: it always uses
 `LUKS_STRIPES`, defined as 4000
 ([`libcryptsetup_macros.h`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/bae21790d59897ac50e5471f953f76b3a58aeeb6/lib/libcryptsetup_macros.h#L62),
@@ -1107,6 +684,31 @@ The experiment
 confirms this layout on a real volume: it formats a throwaway LUKS2
 image with cryptsetup, unlocks keyslot 0 with its own implementation
 of the steps above, and gets the same key that cryptsetup reports.
+
+### How a wrong key is detected
+
+Decrypting a keyslot with the wrong passphrase does not fail by
+itself: it produces the wrong bytes, and merging them produces a wrong
+key. LUKS2 catches this with a *digest* of the master key, kept in the
+header's `digests` object, which "is used to verify that a key
+decrypted from a keyslot is correct"
+([LUKS2 spec v1.1.4](https://gitlab.com/cryptsetup/LUKS2-docs/-/blob/a81aa2fef8d176debdbec297c1e0b74bb50cfee8/luks2_doc_wip.pdf)
+§3.4, p.12). When the digest is created, cryptsetup runs PBKDF2 over
+the master key with a random salt, the hash of the PBKDF setting, and
+an iteration count benchmarked to take about 125 ms
+(`LUKS_MKD_ITERATIONS_MS`,
+[`lib/luks1/luks.h`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/bae21790d59897ac50e5471f953f76b3a58aeeb6/lib/luks1/luks.h#L31),
+line 31), and stores the salt, hash, iteration count and result
+(`PBKDF2_digest_store()`,
+[`lib/luks2/luks2_digest_pbkdf2.c`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/bae21790d59897ac50e5471f953f76b3a58aeeb6/lib/luks2/luks2_digest_pbkdf2.c),
+lines 77–172). To check a merged key, `PBKDF2_digest_verify()` (lines
+15–75) repeats the computation on it and compares the result with the
+stored digest (line 68); a mismatch is reported the same way as a
+wrong passphrase. `cryptsetup open --test-passphrase` stops after this
+check: it does "not activate the device, just verify the passphrase"
+([`man/common_options.adoc`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/bae21790d59897ac50e5471f953f76b3a58aeeb6/man/common_options.adoc),
+lines 1040–1041), which is what
+[`passphrase-recovery.md`](passphrase-recovery.md) relies on.
 
 ## What damage does to the key
 
