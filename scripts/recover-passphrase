@@ -383,7 +383,7 @@ len=${#GUESS}
 # instead of bash's CANDIDATES=()/LABELS=() arrays. This is cleaned up
 # on exit via a trap.
 CAND_FILE="$(mktemp)"
-trap 'rm -f "$CAND_FILE"' EXIT INT TERM
+trap 'rm -f "$CAND_FILE" "$CAND_FILE.uniq"' EXIT INT TERM
 
 add_candidate() {
     printf '%s\t%s\n' "$1" "$2" >>"$CAND_FILE"
@@ -429,6 +429,12 @@ if [ "$DO_INSERTION" -eq 1 ]; then
         i=$((i + 1))
     done
 fi
+
+# Different edits can produce the same string (deleting either 'l' of
+# "ll", for example). Each test costs a full KDF run, so keep only the
+# first occurrence of each candidate.
+awk -F '\t' '!seen[$1]++' "$CAND_FILE" >"$CAND_FILE.uniq"
+mv "$CAND_FILE.uniq" "$CAND_FILE"
 
 total="$( [ -s "$CAND_FILE" ] && wc -l <"$CAND_FILE" || echo 0 )"
 [ "$total" -gt 0 ] || die "no candidates generated (all edit operations disabled?)"
