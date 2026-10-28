@@ -195,9 +195,9 @@ but their `seqid` differs, the one with the higher `seqid` wins (lines
 cryptsetup rewrites the bad copy from the good one with a new salt
 (lines 722–768); if the device also carries other signatures that make
 it ambiguous, it refuses and asks you to run `cryptsetup repair`. In
-the experiment, a read-only `luksDump` worked with a damaged primary
-header but left it damaged, and `cryptsetup repair` rewrote it from
-the secondary; see
+the experiment, with the primary JSON area damaged, `luksDump` and
+`cryptsetup repair` each rewrote the primary header from the secondary,
+with a new salt, and neither printed anything about it; see
 [`checking-for-corruption.md`](checking-for-corruption.md#when-to-run-cryptsetup-repair-and-what-it-cant-fix).
 
 **Keyslot areas have no fixed offsets.** In LUKS1, the header has a

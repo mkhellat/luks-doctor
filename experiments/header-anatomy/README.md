@@ -17,9 +17,9 @@ On a LUKS2 image formatted with cryptsetup's defaults:
 - the part of a keyslot's area beyond its split key material is not
   zero (cryptsetup fills the whole keyslots area with random data when
   formatting);
-- a read-only command such as `luksDump` works with a damaged primary
-  header but does not fix it, and `cryptsetup repair` rewrites it from
-  the secondary with a new salt.
+- when the primary header is damaged, `luksDump` and `cryptsetup
+  repair` each silently rewrite it from the secondary, with a new salt
+  and the original JSON content.
 
 Used in [`docs/luks2-header-anatomy.md`](../../docs/luks2-header-anatomy.md).
 
@@ -52,8 +52,14 @@ The script formats a throwaway image, prints `luksDump` (with random
 values elided), and runs [`parse_headers.py`](parse_headers.py), which
 decodes both binary headers, recomputes their checksums, prints the
 layout from the JSON metadata, and checks keyslot 0's unused tail. It
-then flips one byte of the primary JSON area at offset 8192, runs
-`luksDump` and `repair`, and compares the result with the original.
+then flips one byte of the primary JSON area at offset 8192 and runs
+`luksDump` and `repair`, each on its own fresh copy of the damaged
+image, to see whether that command alone rewrites the primary header.
+An earlier version of this experiment ran both commands on the same
+copy and compared it with the undamaged original, which cannot tell
+these apart (a rewritten header has a new salt, so it differs from the
+original either way); it wrongly concluded that `luksDump` leaves the
+header damaged.
 
 ## Result (2026-10-28)
 
@@ -84,7 +90,7 @@ Keyslots:
 	Cipher:     aes-xts-plain64
 	Cipher key: 512 bits
 	PBKDF:      argon2id
-	Time cost:  5
+	Time cost:  4
 	Memory:     1048576
 	Threads:    4
 	Salt:       <random>
@@ -98,7 +104,7 @@ Tokens:
 Digests:
   0: pbkdf2
 	Hash:       sha256
-	Iterations: 145312
+	Iterations: 147770
 	Salt:       <random>
 	            <random>
 	Digest:     <random>
@@ -115,12 +121,12 @@ Binary header fields (offset in struct, primary value | secondary value):
   0x0010 (  16) seqid            8 B  3 | 3  [same]
   0x0018 (  24) label           48 B  '' | ''  [same]
   0x0048 (  72) csum_alg        32 B  'sha256' | 'sha256'  [same]
-  0x0068 ( 104) salt            64 B  0e85879858af5d72... | ecb242dd97aa9763...  [DIFFERENT]
-  0x00a8 ( 168) uuid            40 B  '8429b3c7-15c7-4ad7-8733-ba87c8cc959f' | '8429b3c7-15c7-4ad7-8733-ba87c8cc959f'  [same]
+  0x0068 ( 104) salt            64 B  3b32d90dfa49c3f1... | 0971a5c39ac5bd3b...  [DIFFERENT]
+  0x00a8 ( 168) uuid            40 B  '25888fea-14c7-41c0-85cf-f258642d0edf' | '25888fea-14c7-41c0-85cf-f258642d0edf'  [same]
   0x00d0 ( 208) subsystem       48 B  '' | ''  [same]
   0x0100 ( 256) hdr_offset       8 B  0 | 16384  [DIFFERENT]
   0x0108 ( 264) _padding       184 B  all zero | all zero  [same]
-  0x01c0 ( 448) csum            64 B  b676b78b32a14a9c... | bbf4ab81299c3eea...  [DIFFERENT]
+  0x01c0 ( 448) csum            64 B  51a35f52c23dd9da... | a2fb27254c2b55b6...  [DIFFERENT]
   0x0200 ( 512) _padding4096  3584 B  all zero | all zero  [same]
 
 Primary header checksum valid:   True
@@ -140,21 +146,28 @@ Layout:
 Keyslot 0: key_size 64 B, split material 256000 B, area 258048 B, unused tail 2048 B, tail is NOT all zero
 
 == Damage: flip one byte of the primary JSON area ==
--- luksDump on the damaged image (read-only):
-   luksDump succeeded
-   image still differs from before the damage
--- cryptsetup repair on the damaged image:
-   repair succeeded
-  0x0068 ( 104) salt            64 B  3a8ee7e395645acd... | ecb242dd97aa9763...  [DIFFERENT]
-Primary header checksum valid:   True
-Secondary header checksum valid: True
+-- cryptsetup luksDump on a fresh copy of the damaged image:
+   luksDump exit status 0
+   nothing on stderr
+   primary header: rewritten
    primary JSON area identical to before the damage
+    0x0068 ( 104) salt            64 B  967c2ee5738003fa... | 0971a5c39ac5bd3b...  [DIFFERENT]
+  Primary header checksum valid:   True
+  Secondary header checksum valid: True
+-- cryptsetup repair on a fresh copy of the damaged image:
+   repair exit status 0
+   nothing on stderr
+   primary header: rewritten
+   primary JSON area identical to before the damage
+    0x0068 ( 104) salt            64 B  281177c0a4901011... | 0971a5c39ac5bd3b...  [DIFFERENT]
+  Primary header checksum valid:   True
+  Secondary header checksum valid: True
 ```
 
 Both listings come from the same run. Salts, UUID, checksums and the
-digest iteration count change on every run; the
-field layout, offsets and sizes do not. After `repair`, the primary
-header's salt (`3a8ee7e3...`) differs from the one it had before the
-damage (`0e858798...`): the repaired header got a new salt, as
-`LUKS2_disk_hdr_read()` does when it rewrites a damaged copy (lines
-743–768) and as the specification requires (§2.1, p.4).
+digest iteration count change on every run; the field layout, offsets
+and sizes do not. In the damage test, each command gave the rewritten
+primary header a different new salt, as `LUKS2_disk_hdr_read()` does
+when it rewrites a damaged copy (lines 743–768) and as the
+specification requires (§2.1, p.4). Neither command printed anything
+about the damage.

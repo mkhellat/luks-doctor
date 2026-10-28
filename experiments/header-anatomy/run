@@ -49,28 +49,38 @@ echo
 echo "== Damage: flip one byte of the primary JSON area =="
 cp "$img" "$work/before.img"
 printf '\377' | dd of="$img" bs=1 seek=8192 conv=notrunc status=none
+cp "$img" "$work/damaged.img"
 
-echo "-- luksDump on the damaged image (read-only):"
-if cryptsetup luksDump "$img" >/dev/null 2>"$work/err"; then
-	echo "   luksDump succeeded"
-else
-	echo "   luksDump failed: $(cat "$work/err")"
-fi
-if cmp -s "$img" "$work/before.img"; then
-	echo "   primary header now identical to before the damage"
-else
-	echo "   image still differs from before the damage"
-fi
-
-echo "-- cryptsetup repair on the damaged image:"
-if cryptsetup repair --batch-mode "$img" 2>"$work/err"; then
-	echo "   repair succeeded"
-else
-	echo "   repair failed: $(cat "$work/err")"
-fi
-python3 -I "$here/parse_headers.py" "$img" | grep -E 'checksum valid|salt'
-if cmp -s -n 12288 -i 4096 "$img" "$work/before.img"; then
-	echo "   primary JSON area identical to before the damage"
-else
-	echo "   primary JSON area differs from before the damage"
-fi
+# Run each command on its own fresh copy of the damaged image, then
+# report whether it rewrote the primary header.
+for cmd in luksDump repair; do
+	cp "$work/damaged.img" "$work/$cmd.img"
+	echo "-- cryptsetup $cmd on a fresh copy of the damaged image:"
+	if [ "$cmd" = luksDump ]; then
+		set -- cryptsetup luksDump "$work/$cmd.img"
+	else
+		set -- cryptsetup repair --batch-mode "$work/$cmd.img"
+	fi
+	if "$@" >/dev/null 2>"$work/err"; then
+		echo "   $cmd exit status 0"
+	else
+		echo "   $cmd failed: $(cat "$work/err")"
+	fi
+	if [ -s "$work/err" ]; then
+		echo "   stderr: $(cat "$work/err")"
+	else
+		echo "   nothing on stderr"
+	fi
+	if cmp -s -n 16384 "$work/$cmd.img" "$work/damaged.img"; then
+		echo "   primary header: left damaged"
+	else
+		echo "   primary header: rewritten"
+	fi
+	if cmp -s -n 12288 -i 4096 "$work/$cmd.img" "$work/before.img"; then
+		echo "   primary JSON area identical to before the damage"
+	else
+		echo "   primary JSON area differs from before the damage"
+	fi
+	python3 -I "$here/parse_headers.py" "$work/$cmd.img" |
+		grep -E 'checksum valid|salt' | sed 's/^/  /'
+done
