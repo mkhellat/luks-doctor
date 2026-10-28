@@ -1,5 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Mohammadreza Khellat <mkhellat@beavernets.com>
 # Run the keyslot damage end-to-end experiment.  See README.md.
 #
 # Creates a throwaway 32 MiB LUKS2 image file in a temporary directory,

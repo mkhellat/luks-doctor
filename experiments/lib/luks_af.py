@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Mohammadreza Khellat <mkhellat@beavernets.com>
 """Python port of cryptsetup's AF splitter (lib/luks1/af.c).
 
 Ported line by line from cryptsetup commit

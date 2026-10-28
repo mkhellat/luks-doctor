@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Mohammadreza Khellat <mkhellat@beavernets.com>
 """How far does damage to one AF stripe spread into the merged key?
 
 Splits a random key with the af.c port, checks the round trip, then

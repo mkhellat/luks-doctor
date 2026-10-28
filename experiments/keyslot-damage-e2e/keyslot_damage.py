@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Mohammadreza Khellat <mkhellat@beavernets.com>
 """How does one damaged byte in a real LUKS2 keyslot area reach the key?
 
 Usage (normally via ./run):
