@@ -1,0 +1,50 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Mohammadreza Khellat <mkhellat@beavernets.com>
+# Run the default key size experiment.  See README.md.
+#
+# Formats a throwaway 32 MiB LUKS2 image file once per cipher, without
+# --key-size, and prints the key sizes cryptsetup chose.  Needs no root
+# and touches no block device.  Everything is deleted on exit.
+set -eu
+
+here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+
+for tool in cryptsetup python3 truncate; do
+	command -v "$tool" >/dev/null 2>&1 || {
+		echo "error: $tool is required" >&2
+		exit 1
+	}
+done
+
+work=$(mktemp -d)
+trap 'rm -rf -- "$work"' EXIT INT TERM
+
+img=$work/test.img
+pass=$work/passphrase
+printf '%s' 'synthetic-test-passphrase' > "$pass"
+
+cryptsetup --version
+echo
+
+for cipher in \
+	aes-xts-plain64 \
+	serpent-xts-plain64 \
+	twofish-xts-plain64 \
+	aes-cbc-essiv:sha256 \
+	xchacha20,aes-adiantum-plain64 \
+	xchacha12,aes-adiantum-plain64
+do
+	rm -f -- "$img"
+	truncate -s 32M "$img"
+	# PBKDF2 with 1000 iterations only to keep the run fast; the KDF
+	# does not affect key sizes.
+	if out=$(cryptsetup luksFormat --type luks2 --batch-mode \
+		--pbkdf pbkdf2 --pbkdf-force-iterations 1000 \
+		--cipher "$cipher" --key-file "$pass" "$img" 2>&1)
+	then
+		python3 -I "$here/show_key_sizes.py" "$cipher" "$img"
+	else
+		printf '%-34s luksFormat failed: %s\n' "$cipher" "$out"
+	fi
+done

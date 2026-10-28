@@ -28,6 +28,7 @@ on exit.
 |---|---|---|
 | [`af-damage-locality/`](af-damage-locality) | How far damage to one AF stripe spreads into the merged key | `python3` |
 | [`keyslot-damage-e2e/`](keyslot-damage-e2e) | How one damaged byte in a real LUKS2 keyslot area reaches the key, and what cryptsetup reports | `cryptsetup`, `python3`, Python `cryptography` |
+| [`default-key-sizes/`](default-key-sizes) | Which master key size `luksFormat` picks for each cipher without `--key-size`, and which cipher the keyslot area uses | `cryptsetup`, `python3` |
 
 ## Running
 
@@ -36,6 +37,7 @@ From the repository root:
 ```
 experiments/af-damage-locality/run
 experiments/keyslot-damage-e2e/run
+experiments/default-key-sizes/run
 ```
 
 The `run` scripts pass `shellcheck --shell=sh`. They were run under
