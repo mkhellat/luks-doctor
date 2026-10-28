@@ -32,6 +32,7 @@ on exit.
 | [`header-anatomy/`](header-anatomy) | The binary header layout, how the primary and secondary headers differ, the default on-disk layout, and how cryptsetup handles a damaged primary header | `cryptsetup`, `python3`; up to 1 GiB RAM for the default Argon2id |
 | [`corruption-signals/`](corruption-signals) | What `luksDump`, `repair` and `open --test-passphrase` report for different kinds of keyslot and header damage, and what a header backup contains | `cryptsetup`, `xxd` |
 | [`entropy-tests/`](entropy-tests) | What chi-squared, Shannon entropy, the SP 800-22 monobit test, `inspect-keyslot`'s heuristics and `cryptsetup repair` detect in a real keyslot area under different kinds of damage | `cryptsetup`, `python3`, Python `scipy` |
+| [`passphrase-recovery/`](passphrase-recovery) | Which one-slip guesses `scripts/recover-passphrase` recovers and which it cannot, its error handling, and the time per guess with default Argon2id | `cryptsetup`; up to 1 GiB RAM |
 
 ## Running
 
@@ -44,6 +45,7 @@ experiments/default-key-sizes/run
 experiments/header-anatomy/run
 experiments/corruption-signals/run
 experiments/entropy-tests/run
+experiments/passphrase-recovery/run
 ```
 
 The `run` scripts pass `shellcheck --shell=sh`. They were run under

@@ -1,0 +1,89 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Mohammadreza Khellat <mkhellat@beavernets.com>
+# Run the passphrase recovery experiment.  See README.md.
+#
+# Formats throwaway LUKS2 image files with a synthetic passphrase and
+# runs scripts/recover-passphrase against them with guesses that are
+# one slip away.  Needs no root and touches no block device.
+# Everything is deleted on exit.
+set -eu
+
+here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+repo=$(CDPATH='' cd -- "$here/../.." && pwd)
+rp=$repo/scripts/recover-passphrase
+
+for tool in cryptsetup truncate sha256sum date; do
+	command -v "$tool" >/dev/null 2>&1 || {
+		echo "error: $tool is required" >&2
+		exit 1
+	}
+done
+
+work=$(mktemp -d)
+trap 'rm -rf -- "$work"' EXIT INT TERM
+
+cryptsetup --version
+pass='Tango-ok7'
+printf '%s' "$pass" > "$work/passphrase"
+
+# Image 1: PBKDF2 with 1000 iterations, so a full search takes seconds.
+img=$work/fast.img
+truncate -s 32M "$img"
+cryptsetup luksFormat --type luks2 --batch-mode \
+	--pbkdf pbkdf2 --pbkdf-force-iterations 1000 \
+	--key-file "$work/passphrase" "$img"
+echo "Real passphrase: $pass"
+
+# Print the lines that summarize a search, with the temporary path
+# masked.
+search() {
+	echo
+	echo "== Guess '$1' ($2) =="
+	before=$(sha256sum < "$img")
+	set +e
+	sh "$rp" "$img" "$1" > "$work/out" 2>&1
+	status=$?
+	set -e
+	sed -e "s|$work|<tmpdir>|g" "$work/out" |
+		grep -E 'generated|base guess itself|MATCH|working passphrase|no match found|error' |
+		grep -v -- '\.\.\. no match$' || true
+	echo "   exit status: $status"
+	if [ "$(sha256sum < "$img")" = "$before" ]; then
+		echo "   image unchanged by the search"
+	else
+		echo "   image CHANGED by the search"
+	fi
+}
+
+search 'Tango-ok7'   'the real passphrase'
+search 'Tango-okk7'  'one extra character'
+search 'Tango-ol7'   'k typed as its neighbour l'
+search 'Tango-ok'    'final digit missing'
+search 'Tango-o7'    'letter missing'
+search 'Rango-ok7'   'uppercase T typed as its neighbour R'
+
+echo
+echo "== A file that is not a LUKS device =="
+truncate -s 1M "$work/notluks.img"
+set +e
+sh "$rp" "$work/notluks.img" 'Tango-ok7' 2>&1 | sed -e "s|$work|<tmpdir>|g"
+set -e
+
+# Image 2: cryptsetup's default Argon2id settings, to time one test.
+echo
+echo "== Time for one --test-passphrase with default Argon2id =="
+img2=$work/default.img
+truncate -s 32M "$img2"
+cryptsetup luksFormat --type luks2 --batch-mode \
+	--key-file "$work/passphrase" "$img2"
+cryptsetup luksDump "$img2" | grep -E 'Time cost|Memory|Threads'
+for _ in 1 2 3; do
+	start=$(date +%s%N)
+	set +e
+	printf '%s' 'wrong-guess' | cryptsetup open --test-passphrase "$img2" 2>/dev/null
+	status=$?
+	set -e
+	end=$(date +%s%N)
+	echo "   wrong passphrase: exit status $status, $(( (end - start) / 1000000 )) ms"
+done
