@@ -1173,6 +1173,14 @@ passes
 So decrypting a damaged 16-byte block scrambles that block's 16 bytes
 of plaintext and nothing else.
 
+This section and its experiment cover `aes-xts-plain64` only. The
+keyslot area uses the volume's own cipher whenever it can
+([`experiments/default-key-sizes/`](../experiments/default-key-sizes)
+shows this for XTS, CBC and Adiantum volumes), and other modes do not
+encrypt in independent 16-byte blocks, so on a volume formatted with
+a non-XTS cipher one damaged byte reaches a different amount of the
+split material.
+
 No XTS block crosses a stripe boundary: blocks start every 16 bytes
 from the start of each 512-byte sector, sectors start every 512 bytes
 from the start of the area, and stripes start every 64 bytes (or 32,
