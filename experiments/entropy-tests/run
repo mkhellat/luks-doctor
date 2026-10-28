@@ -1,0 +1,42 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Mohammadreza Khellat <mkhellat@beavernets.com>
+# Run the entropy tests experiment.  See README.md.
+#
+# Formats a throwaway 32 MiB LUKS2 image file and runs statistical
+# tests on its keyslot area, intact and damaged in several ways.  Needs
+# no root and touches no block device.  Everything is deleted on exit.
+set -eu
+
+here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+repo=$(CDPATH='' cd -- "$here/../.." && pwd)
+
+for tool in cryptsetup python3 truncate; do
+	command -v "$tool" >/dev/null 2>&1 || {
+		echo "error: $tool is required" >&2
+		exit 1
+	}
+done
+python3 -I -c 'import scipy' 2>/dev/null || {
+	echo "error: the Python 'scipy' package is required" >&2
+	exit 1
+}
+
+work=$(mktemp -d)
+trap 'rm -rf -- "$work"' EXIT INT TERM
+
+img=$work/test.img
+pass=$work/passphrase
+printf '%s' 'synthetic-test-passphrase' > "$pass"
+truncate -s 32M "$img"
+
+cryptsetup --version
+python3 -I -c 'import scipy; print("scipy", scipy.__version__)'
+# PBKDF2 with 1000 iterations only to keep the run fast; the KDF does
+# not affect the keyslot area's contents' statistics.
+cryptsetup luksFormat --type luks2 --batch-mode \
+	--pbkdf pbkdf2 --pbkdf-force-iterations 1000 \
+	--key-file "$pass" "$img"
+
+# The repository's LICENSE (the GPL text) is the English text sample.
+python3 -I "$here/entropy_tests.py" "$img" "$repo/LICENSE" "$work"

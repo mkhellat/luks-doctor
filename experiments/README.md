@@ -31,6 +31,7 @@ on exit.
 | [`default-key-sizes/`](default-key-sizes) | Which master key size `luksFormat` picks for each cipher without `--key-size`, and which cipher the keyslot area uses | `cryptsetup`, `python3` |
 | [`header-anatomy/`](header-anatomy) | The binary header layout, how the primary and secondary headers differ, the default on-disk layout, and how cryptsetup handles a damaged primary header | `cryptsetup`, `python3`; up to 1 GiB RAM for the default Argon2id |
 | [`corruption-signals/`](corruption-signals) | What `luksDump`, `repair` and `open --test-passphrase` report for different kinds of keyslot and header damage, and what a header backup contains | `cryptsetup`, `xxd` |
+| [`entropy-tests/`](entropy-tests) | What chi-squared, Shannon entropy, the SP 800-22 monobit test, `inspect-keyslot`'s heuristics and `cryptsetup repair` detect in a real keyslot area under different kinds of damage | `cryptsetup`, `python3`, Python `scipy` |
 
 ## Running
 
@@ -42,6 +43,7 @@ experiments/keyslot-damage-e2e/run
 experiments/default-key-sizes/run
 experiments/header-anatomy/run
 experiments/corruption-signals/run
+experiments/entropy-tests/run
 ```
 
 The `run` scripts pass `shellcheck --shell=sh`. They were run under
