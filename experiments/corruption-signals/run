@@ -1,0 +1,153 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Mohammadreza Khellat <mkhellat@beavernets.com>
+# Run the corruption signals experiment.  See README.md.
+#
+# Formats a throwaway 32 MiB LUKS2 image file, damages copies of it in
+# several ways, and records what cryptsetup luksDump, repair and
+# open --test-passphrase report for each.  Needs no root and touches no
+# block device.  Everything is deleted on exit.
+set -eu
+
+for tool in cryptsetup truncate dd xxd cmp; do
+	command -v "$tool" >/dev/null 2>&1 || {
+		echo "error: $tool is required" >&2
+		exit 1
+	}
+done
+
+work=$(mktemp -d)
+trap 'rm -rf -- "$work"' EXIT INT TERM
+
+img=$work/test.img
+pass=$work/passphrase
+printf '%s' 'synthetic-test-passphrase' > "$pass"
+truncate -s 32M "$img"
+
+cryptsetup --version
+# PBKDF2 with 1000 iterations only to keep the run fast; the KDF does
+# not affect any of the checks below.
+cryptsetup luksFormat --type luks2 --batch-mode \
+	--pbkdf pbkdf2 --pbkdf-force-iterations 1000 \
+	--key-file "$pass" "$img"
+area=32768	# keyslot 0's Area offset with these defaults
+
+# Run one cryptsetup command, print its stdout+stderr indented and its
+# exit status.
+show() {
+	set +e
+	out=$("$@" 2>&1)
+	status=$?
+	set -e
+	if [ -n "$out" ]; then
+		printf '%s\n' "$out" | sed -e "s|$work|<tmpdir>|g" -e 's/^/      /'
+	fi
+	echo "      exit status: $status"
+}
+
+# Run luksDump, discarding its normal output; print anything it writes
+# to stderr and its exit status.
+show_dump() {
+	set +e
+	cryptsetup luksDump "$1" >/dev/null 2>"$work/dump.err"
+	status=$?
+	set -e
+	if [ -s "$work/dump.err" ]; then
+		sed -e "s|$work|<tmpdir>|g" -e 's/^/      /' "$work/dump.err"
+	fi
+	echo "      exit status: $status"
+}
+
+# Apply all three checks to one image.
+check() {
+	echo "   luksDump (stdout discarded):"
+	show_dump "$1"
+	echo "   open --test-passphrase:"
+	show cryptsetup open --test-passphrase --key-file "$pass" "$1"
+	echo "   repair:"
+	show cryptsetup repair --batch-mode "$1"
+}
+
+echo
+echo "== Keyslot listing: what the pattern '^  [0-9]+: ' matches =="
+cryptsetup luksDump "$img" | grep -E '^  [0-9]+: '
+echo "== Keyslots section only =="
+cryptsetup luksDump "$img" | sed -n '/^Keyslots:/,/^Tokens:/p' |
+	grep -E '^  [0-9]+: '
+
+echo
+echo "== Header backup size =="
+cryptsetup luksHeaderBackup --batch-mode "$img" \
+	--header-backup-file "$work/backup.img"
+echo "   $(wc -c < "$work/backup.img") bytes"
+
+echo
+echo "== Case 0: intact image =="
+cp "$img" "$work/c0.img"
+check "$work/c0.img"
+
+echo
+echo "== Case 1: 4096 bytes of keyslot area zeroed (area offset 8192) =="
+cp "$img" "$work/c1.img"
+dd if=/dev/zero of="$work/c1.img" bs=1 seek=$((area + 8192)) count=4096 \
+	conv=notrunc status=none
+dd if="$work/c1.img" bs=1 skip=$((area + 8192 - 32)) count=96 status=none | xxd
+check "$work/c1.img"
+
+echo
+echo "== Case 2: 4096 bytes of keyslot area filled with de ad be ef =="
+cp "$img" "$work/c2.img"
+i=0
+while [ "$i" -lt 1024 ]; do
+	printf '\336\255\276\357'
+	i=$((i + 1))
+done > "$work/pattern"
+dd if="$work/pattern" of="$work/c2.img" bs=1 seek=$((area + 8192)) \
+	conv=notrunc status=none
+dd if="$work/c2.img" bs=1 skip=$((area + 8192 - 32)) count=96 status=none | xxd
+check "$work/c2.img"
+
+echo
+echo "== Case 3: one byte of keyslot area flipped (area offset 8192) =="
+cp "$img" "$work/c3.img"
+printf '\001' | dd of="$work/c3.img" bs=1 seek=$((area + 8192)) \
+	conv=notrunc status=none
+check "$work/c3.img"
+
+echo
+echo "== Case 4: one byte of the primary JSON area changed =="
+cp "$img" "$work/c4.img"
+printf '\377' | dd of="$work/c4.img" bs=1 seek=8192 conv=notrunc status=none
+cp "$work/c4.img" "$work/c4-damaged.img"
+primary_state() {
+	if cmp -s -n 16384 "$work/c4.img" "$work/c4-damaged.img"; then
+		echo "      primary header: still damaged"
+	else
+		echo "      primary header: rewritten"
+	fi
+}
+echo "   luksDump (stdout discarded):"
+show_dump "$work/c4.img"
+primary_state
+echo "   open --test-passphrase:"
+show cryptsetup open --test-passphrase --key-file "$pass" "$work/c4.img"
+primary_state
+echo "   repair:"
+show cryptsetup repair --batch-mode "$work/c4.img"
+primary_state
+if cmp -s -n 12288 -i 4096 "$work/c4.img" "$img"; then
+	echo "   primary JSON area now identical to the original"
+fi
+
+echo
+echo "== Case 5: both JSON areas changed (bytes 8192 and 16384+8192) =="
+cp "$img" "$work/c5.img"
+printf '\377' | dd of="$work/c5.img" bs=1 seek=8192 conv=notrunc status=none
+printf '\377' | dd of="$work/c5.img" bs=1 seek=$((16384 + 8192)) \
+	conv=notrunc status=none
+check "$work/c5.img"
+echo "   luksHeaderRestore from the backup taken earlier:"
+show cryptsetup luksHeaderRestore --batch-mode "$work/c5.img" \
+	--header-backup-file "$work/backup.img"
+echo "   open --test-passphrase after restore:"
+show cryptsetup open --test-passphrase --key-file "$pass" "$work/c5.img"
