@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Mohammadreza Khellat <mkhellat@beavernets.com>
 #
 # inspect-keyslot - extract and hex-dump a LUKS2 keyslot's raw key
 # material area directly from a device, with a rough visual corruption

@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Mohammadreza Khellat <mkhellat@beavernets.com>
 #
 # recover-passphrase - bounded edit-distance-1 search for a nearly-
 # correct LUKS2 passphrase (one substitution, deletion, or insertion
