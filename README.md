@@ -263,7 +263,16 @@ that either doc is itself a scoped feature to implement directly:
   key-lifecycle diagram's bio-dispatch layer but not itself traced;
   **(2)** the full userspace-to-kernel unlock path — keyslot unwrap,
   AF-merge, digest verification, and the `luksOpen` handoff into the
-  kernel-side diagram that already exists.
+  kernel-side diagram that already exists. **(3)** Re-trace the
+  existing key-lifecycle diagram against Linux v7.4 once it is
+  released. The diagram's pinned commits are all part of v7.3; since
+  then, kernel master has moved x86's AES-NI XTS code into the AES
+  library
+  ([`2bd68888`](https://github.com/torvalds/linux/commit/2bd6888849d6d2d5497c2470cc71c8d2cb170523))
+  and raised the library-backed `xts-aes-lib`'s x86 priority to 500
+  ([`f410daa3`](https://github.com/torvalds/linux/commit/f410daa32cfcd94263f156662a1ad2097505443c)),
+  so on x86 the backend selection, keying and per-sector layers will
+  likely change.
 
 ## Contributing
 
