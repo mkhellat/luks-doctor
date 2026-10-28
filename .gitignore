@@ -12,3 +12,6 @@ CLAUDE.md
 *.raw
 test-volume*
 scratch/
+
+# Python bytecode (experiments/)
+__pycache__/

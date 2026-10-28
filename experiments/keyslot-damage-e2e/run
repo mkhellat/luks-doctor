@@ -1,0 +1,62 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Run the keyslot damage end-to-end experiment.  See README.md.
+#
+# Creates a throwaway 32 MiB LUKS2 image file in a temporary directory,
+# with a synthetic passphrase.  Needs no root and touches no block
+# device.  Everything is deleted on exit.
+set -eu
+
+here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+
+for tool in cryptsetup python3 truncate dd; do
+	command -v "$tool" >/dev/null 2>&1 || {
+		echo "error: $tool is required" >&2
+		exit 1
+	}
+done
+python3 -I -c 'import cryptography' 2>/dev/null || {
+	echo "error: the Python 'cryptography' package is required" >&2
+	exit 1
+}
+
+work=$(mktemp -d)
+trap 'rm -rf -- "$work"' EXIT INT TERM
+
+img=$work/test.img
+pass=$work/passphrase
+vk=$work/volume-key
+
+printf '%s' 'synthetic-test-passphrase' > "$pass"
+truncate -s 32M "$img"
+
+# cryptsetup defaults (aes-xts-plain64, 512-bit key, sha256 AF hash),
+# except PBKDF2 with 1000 iterations so the script can derive the key
+# without an Argon2 library.
+cryptsetup luksFormat --type luks2 --batch-mode \
+	--pbkdf pbkdf2 --pbkdf-force-iterations 1000 \
+	--key-file "$pass" "$img"
+cryptsetup luksDump --batch-mode --dump-volume-key \
+	--volume-key-file "$vk" --key-file "$pass" "$img" >/dev/null
+
+python3 -I "$here/keyslot_damage.py" "$img" "$pass" "$vk"
+
+# What cryptsetup itself reports for a keyslot with one damaged byte.
+area_offset=$(cryptsetup luksDump --dump-json-metadata "$img" |
+	python3 -I -c 'import json,sys; print(json.load(sys.stdin)["keyslots"]["0"]["area"]["offset"])')
+cp "$img" "$work/damaged.img"
+printf '\001' | dd of="$work/damaged.img" bs=1 seek=$((area_offset + 5)) \
+	conv=notrunc status=none
+
+echo
+echo "cryptsetup on the intact image:"
+if cryptsetup open --test-passphrase --key-file "$pass" "$img"; then
+	echo "  passphrase accepted (exit 0)"
+fi
+echo "cryptsetup on the image with one byte of keyslot area changed:"
+set +e
+out=$(cryptsetup open --test-passphrase --key-file "$pass" "$work/damaged.img" 2>&1)
+status=$?
+set -e
+printf '%s\n' "$out" | sed 's/^/  /'
+echo "  exit status: $status"

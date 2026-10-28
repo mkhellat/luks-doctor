@@ -1,0 +1,13 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Run the AF damage-locality experiment.  See README.md.
+set -eu
+
+here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+
+command -v python3 >/dev/null 2>&1 || {
+	echo "error: python3 is required" >&2
+	exit 1
+}
+
+exec python3 -I "$here/af_damage_locality.py"
