@@ -387,22 +387,39 @@ being concrete about, since none of them are stated anywhere above:
   Amber nodes are structurally confirmed to exist in source but have
   at least one unverified edge — most importantly, the `lskcipher`-to-
   `skcipher` adaptation shim that lets `crypto/xts.c`'s generic
-  template obtain a handle to `ecb(aes)` (now registered as an
-  `lskcipher`, not a `skcipher`, per the same kernel restructuring
-  described below). Do not treat amber nodes as fully verified the way
-  the rest of the graph is.
+  template obtain a handle to `ecb(aes)`, which `crypto/ecb.c` has
+  registered as an `lskcipher`, not a `skcipher`, since Linux v6.7
+  ([`32a8dc4a`](https://github.com/torvalds/linux/commit/32a8dc4afcfb098ef4e8b465c90db17d22d90107),
+  `crypto: ecb - Convert from skcipher to lskcipher`). Do not treat
+  amber nodes as fully verified the way the rest of the graph is.
 
   **The single biggest finding from building this diagram**: an
-  earlier version of this doc cited `crypto_aes_ctx`/`aes_expandkey()`
-  in `crypto/aes_generic.c` as *the* generic AES key-schedule path.
-  That file no longer exists — a 2026 kernel restructuring
-  (`crypto: aes - Replace aes-generic with wrapper around lib`)
-  replaced it with `crypto/aes.c` (a thin Crypto API wrapper) backed
-  by a new `lib/crypto/aes.c`. As a direct consequence, `xts(aes)` is
-  registered **three separate times** in the current kernel, ranked by
-  `cra_priority`, and `crypto_alloc_skcipher()` picks whichever is
-  highest and available — this diagram's Setup/Keying/Encrypt-Decrypt
-  layers all branch three ways for exactly this reason, not two.
+  earlier version of this doc cited `crypto_aes_expand_key()` in
+  `crypto/aes_generic.c` as the AES key-schedule routine. That
+  function was real but long outdated. Linux v5.4 replaced it with the
+  shared library routine `aes_expandkey()` in `lib/crypto/aes.c`
+  ([`5bb12d78`](https://github.com/torvalds/linux/commit/5bb12d7825adf0e80b849a273834f3131a6cc4e1),
+  `crypto: aes-generic - drop key expansion routine in favor of
+  library version`), and v7.0 deleted `crypto/aes_generic.c`,
+  replacing it with `crypto/aes.c`, a Crypto API wrapper around that
+  library
+  ([`a2484474`](https://github.com/torvalds/linux/commit/a2484474272ef98d9580d8c610b0f7c6ed2f146c),
+  `crypto: aes - Replace aes-generic with wrapper around lib`). At
+  this diagram's pinned commits, all of which are part of the v7.3
+  release, `xts(aes)` is registered **three
+  separate times**: AES-NI's `xts-aes-aesni`; the library-backed
+  `xts-aes-lib`, which v7.3 added to `crypto/aes.c`
+  ([`94efa0c9`](https://github.com/torvalds/linux/commit/94efa0c9fb36b0f8be480f24bce2bb673005bfde),
+  `crypto: aes - Add XTS support using library`); and the generic
+  `xts` template over `ecb(aes)`. `crypto_alloc_skcipher()` picks the
+  highest `cra_priority` available, so the diagram's
+  Setup/Keying/Encrypt-Decrypt layers all branch three ways, not two.
+  Unreleased kernel master has since moved x86's AES-NI XTS code into
+  the library
+  ([`2bd68888`](https://github.com/torvalds/linux/commit/2bd6888849d6d2d5497c2470cc71c8d2cb170523))
+  and raised `xts-aes-lib`'s x86 priority to 500
+  ([`f410daa3`](https://github.com/torvalds/linux/commit/f410daa32cfcd94263f156662a1ad2097505443c));
+  this diagram does not reflect that yet.
 
   **Citations** (all fetched and line-checked directly against the
   pinned commit shown, verified 2026-08-20):

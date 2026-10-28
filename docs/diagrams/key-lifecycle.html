@@ -384,18 +384,30 @@
     <div class="callout finding">
       <span class="callout-label">Why this graph looks the way it does</span>
       <p style="margin:0; max-width: 62ch;">
-        An earlier draft of the source doc cited <code>crypto_aes_ctx</code> /
-        <code>aes_expandkey()</code> in <code>crypto/aes_generic.c</code> as
-        <em>the</em> generic AES key-schedule path. That file no longer
-        exists — a 2026 kernel restructuring ("crypto: aes &mdash; Replace
-        aes-generic with wrapper around lib") replaced it with
-        <code>crypto/aes.c</code>, a thin wrapper backed by a new
-        <code>lib/crypto/aes.c</code>. As a direct result, <code>xts(aes)</code>
-        is registered <strong>three separate times</strong> in the current
-        kernel, ranked by <code>cra_priority</code>, and
-        <code>crypto_alloc_skcipher()</code> picks whichever is highest and
-        available. Every layer below branches three ways for exactly this
-        reason.
+        An earlier draft of the source doc cited
+        <code>crypto_aes_expand_key()</code> in <code>crypto/aes_generic.c</code>
+        as the AES key-schedule routine. That function was real but long
+        outdated: Linux v5.4 replaced it with the shared library routine
+        <code>aes_expandkey()</code> in <code>lib/crypto/aes.c</code>
+        (<a href="https://github.com/torvalds/linux/commit/5bb12d7825adf0e80b849a273834f3131a6cc4e1" target="_blank" rel="noopener">5bb12d78</a>),
+        and v7.0 deleted <code>crypto/aes_generic.c</code>, replacing it with
+        <code>crypto/aes.c</code>, a Crypto API wrapper around that library
+        (<a href="https://github.com/torvalds/linux/commit/a2484474272ef98d9580d8c610b0f7c6ed2f146c" target="_blank" rel="noopener">a2484474</a>).
+        At this graph's pinned commits, all of which are part of the v7.3
+        release, <code>xts(aes)</code> is registered
+        <strong>three separate times</strong>: AES-NI's
+        <code>xts-aes-aesni</code>, the library-backed <code>xts-aes-lib</code>
+        that v7.3 added to <code>crypto/aes.c</code>
+        (<a href="https://github.com/torvalds/linux/commit/94efa0c9fb36b0f8be480f24bce2bb673005bfde" target="_blank" rel="noopener">94efa0c9</a>),
+        and the generic <code>xts</code> template over <code>ecb(aes)</code>.
+        <code>crypto_alloc_skcipher()</code> picks the highest
+        <code>cra_priority</code> available, so every layer below branches
+        three ways. Unreleased kernel master has since moved x86's AES-NI XTS
+        code into the library
+        (<a href="https://github.com/torvalds/linux/commit/2bd6888849d6d2d5497c2470cc71c8d2cb170523" target="_blank" rel="noopener">2bd68888</a>)
+        and raised <code>xts-aes-lib</code>'s x86 priority to 500
+        (<a href="https://github.com/torvalds/linux/commit/f410daa32cfcd94263f156662a1ad2097505443c" target="_blank" rel="noopener">f410daa3</a>);
+        this graph does not reflect that yet.
       </p>
     </div>
   </section>
