@@ -247,6 +247,10 @@
     max-width: none !important;
     display: block;
   }
+  /* The page-wide p rule would otherwise set node label text to --ink,
+     overriding Mermaid's own label colours (in dark mode that put
+     near-white text on the light amber nodes). */
+  .diagram-pan-layer .mermaid p { color: inherit; }
   .diagram-node-flash > rect,
   .diagram-node-flash > polygon {
     animation: node-flash 1.6s ease-out;
@@ -846,6 +850,21 @@ flowchart TD
 <script type="module">
   import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
   const isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+  // The classDef colours are fixed light-theme values, and Mermaid
+  // applies them as inline !important styles that CSS can't override.
+  // In dark mode, rewrite them before rendering to the page's dark amber
+  // tokens, so the nodes match the legend swatch.
+  if (isDark) {
+    const css = getComputedStyle(document.documentElement);
+    const token = name => css.getPropertyValue(name).trim();
+    const lightDef = 'classDef unverified fill:#fbeed6,stroke:#d9ab5c,color:#664d03';
+    const darkDef = 'classDef unverified fill:' + token('--amber-bg') +
+      ',stroke:' + token('--amber-rule') + ',color:' + token('--amber');
+    const walker = document.createTreeWalker(document.querySelector('pre.mermaid'), NodeFilter.SHOW_TEXT);
+    for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+      if (n.data.includes(lightDef)) n.data = n.data.replace(lightDef, darkDef);
+    }
+  }
   mermaid.initialize({ startOnLoad: true, theme: isDark ? 'dark' : 'default', securityLevel: 'loose' });
 </script>
 </body>
