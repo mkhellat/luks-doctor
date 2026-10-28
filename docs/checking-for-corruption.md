@@ -1,11 +1,14 @@
 # Checking a LUKS2 Volume for Corruption
 
-This is a practical, step-by-step guide to inspecting a LUKS2 device
-directly — extracting raw bytes with `dd`, reading them with `xxd`, and
-telling the difference between "this looks fine" and "this is actually
-damaged." It assumes you've read (or will read)
-[`luks2-header-anatomy.md`](luks2-header-anatomy.md) for the underlying
-concepts; this doc is the "how do I actually look" companion.
+This is a practical guide to inspecting a LUKS2 device directly:
+extracting raw bytes with `dd`, reading them with `xxd`, and using
+cryptsetup's own checks to tell a damaged header or keyslot from a
+wrong passphrase. It builds on
+[`luks2-header-anatomy.md`](luks2-header-anatomy.md), which explains
+the structures involved. What cryptsetup prints in each situation
+below was recorded by
+[`experiments/corruption-signals/`](../experiments/corruption-signals)
+with cryptsetup 2.8.8.
 
 **Before anything else, back up the header:**
 
@@ -13,10 +16,13 @@ concepts; this doc is the "how do I actually look" companion.
 sudo cryptsetup luksHeaderBackup /dev/sdX --header-backup-file ./header-backup.img
 ```
 
-This is cheap (the header region is small, typically a few MiB), fast,
-and means nothing you do below — even a mistake — can make things worse
-than they already are. Do this before any exploratory `repair` or
-inspection work on a device you care about.
+The backup holds "the LUKS header and keyslot area"
+([man page](https://gitlab.com/cryptsetup/cryptsetup/-/blob/bae21790d59897ac50e5471f953f76b3a58aeeb6/man/cryptsetup-luksHeaderBackup.8.adoc)):
+16 MiB with cryptsetup's default layout. With it, whatever goes wrong
+during the steps below, you can put the header back as it was. Keep
+it safe: any passphrase that is valid when the backup is taken can
+later open the volume with it, even after that passphrase is removed
+from the device.
 
 ## Contents
 
@@ -24,27 +30,26 @@ inspection work on a device you care about.
 - [Extracting a keyslot's raw bytes with `dd`](#extracting-a-keyslots-raw-bytes-with-dd)
 - [What healthy key material looks like](#what-healthy-key-material-looks-like)
 - [What corrupted key material looks like](#what-corrupted-key-material-looks-like)
+- [What no inspection can detect](#what-no-inspection-can-detect)
 - [Diffing primary vs. secondary headers](#diffing-primary-vs-secondary-headers)
 - [When to run `cryptsetup repair`, and what it can't fix](#when-to-run-cryptsetup-repair-and-what-it-cant-fix)
 - [Decision guide](#decision-guide)
 
 ## Confirm you have the right device
 
-Before touching anything, confirm `/dev/sdX` is actually the LUKS device you
-think it is — everything below reads and interprets raw bytes at absolute
-offsets, and running it against the wrong device (a stale path after a USB
-re-enumeration, a similarly-named device, a partition vs. the whole disk)
-produces confusing garbage that looks exactly like corruption but isn't:
+Everything below reads raw bytes at absolute offsets, so first make
+sure `/dev/sdX` is the LUKS device you mean. A device path can change
+when a USB enclosure is replugged, and reading the wrong device (or a
+whole disk instead of its partition) gives bytes that are easy to
+mistake for corruption:
 
 ```
 sudo blkid /dev/sdX
 ```
 
-Expect `TYPE="crypto_LUKS"` in the output. If `blkid` shows a different type,
-shows nothing, or the device node doesn't match what you expect from
-`lsblk`/`dmesg` (e.g. after replugging a USB enclosure, which can reassign
-`/dev/sdX` letters), stop and re-identify the device before proceeding — do
-not extrapolate corruption findings from the wrong device.
+Expect `TYPE="crypto_LUKS"`. If `blkid` shows another type or nothing,
+or the device doesn't match what `lsblk` shows, stop and identify the
+device again before going further.
 
 ## Extracting a keyslot's raw bytes with `dd`
 
@@ -54,28 +59,25 @@ First, get the keyslot's byte range from `luksDump`:
 sudo cryptsetup luksDump /dev/sdX
 ```
 
-Find the keyslot you care about and note its `Area offset` and
-`Area length` (both in bytes) — see
-[`luks2-header-anatomy.md#reading-area-offset--area-length`](luks2-header-anatomy.md#reading-area-offset--area-length)
-for what these mean.
+Find the keyslot you want and note its `Area offset` and `Area length`,
+both in bytes (see
+[`luks2-header-anatomy.md#reading-area-offset--area-length`](luks2-header-anatomy.md#reading-area-offset--area-length)).
 
-**Checking more than one keyslot**: a volume can have several independent
-keyslots, and their numbers are not guaranteed to be contiguous starting at
-`0` — a keyslot can be removed (`luksKillSlot`) without renumbering the
-ones that remain, so a two-keyslot volume might show slots `0` and `2`,
-not `0` and `1`. List every keyslot number actually present before deciding
-which ones to inspect:
+**Checking more than one keyslot.** Keyslot numbers need not be
+contiguous: removing a keyslot does not renumber the others, so a
+volume with two keyslots may have slots `0` and `2`. To list the
+keyslots present, look only at the `Keyslots:` section of `luksDump`,
+since data segments and digests are numbered the same way:
 
 ```
-sudo cryptsetup luksDump /dev/sdX | grep -E '^  [0-9]+: '
+sudo cryptsetup luksDump /dev/sdX | sed -n '/^Keyslots:/,/^Tokens:/p' | grep -E '^  [0-9]+: '
 ```
 
-Each listed slot has its own independent `Area offset`/`Area length` —
-repeat the extraction below for each one you need to check. This matters
-because damage is typically local to whichever slot was being written when
-something went wrong; an intact slot elsewhere on the same device is a
-legitimate way back in if the one you were using is damaged (see the
-decision guide below).
+Each keyslot has its own `Area offset` and `Area length`; repeat the
+extraction below for each one. Every keyslot holds its own copy of the
+master key, so an intact keyslot whose passphrase you know is a way
+back in even if another keyslot is damaged (see the
+[decision guide](#decision-guide)).
 
 Then extract exactly that byte range:
 
@@ -85,180 +87,172 @@ sudo dd if=/dev/sdX bs=1 skip=<Area offset> count=<Area length> 2>/dev/null | xx
 
 What each part does:
 
-- `if=/dev/sdX` — input file: the raw device (or a disk image file —
-  this works identically on an `.img` file, which is often safer for
-  repeated experimentation).
-- `bs=1` — block size of 1 byte. This is what makes `skip=`/`count=`
-  operate in exact bytes rather than in whatever the default block size
-  is (512 bytes, historically). It's slower than a larger block size,
-  but for a region this small (a few hundred KB at most) the difference
-  is imperceptible, and byte-exact addressing is worth the tradeoff —
-  you do not want off-by-block-size errors when the whole point is
-  precise inspection.
-- `skip=<Area offset>` — skip this many blocks (= bytes, since `bs=1`)
-  from the start of the input before reading anything. This seeks to
-  the start of the keyslot area.
-- `count=<Area length>` — read exactly this many blocks (= bytes) and
-  stop. This reads exactly the keyslot area and nothing beyond it.
-- `2>/dev/null` — suppress `dd`'s normal "N bytes copied" status message
-  on stderr, so it doesn't interleave with or follow the piped output.
-- `| xxd` — pipe the raw bytes into `xxd`, which renders them as a
-  readable hex+ASCII dump instead of dumping raw binary to your
-  terminal.
+- `if=/dev/sdX`: the input, the device, or an image file of it; working
+  on an image is safer for repeated experiments.
+- `bs=1`: a block size of 1 byte, so `skip=` and `count=` count bytes.
+  (Without it, `dd` uses 512-byte blocks.)
+- `skip=<Area offset>`: skip that many bytes before reading.
+- `count=<Area length>`: read exactly that many bytes.
+- `2>/dev/null`: hide `dd`'s summary of bytes copied, which it writes
+  to stderr.
+- `| xxd`: show the bytes as a hex and ASCII dump.
 
-`scripts/inspect-keyslot` does this computation and extraction for
-you automatically, including handling the case of multiple keyslots —
-see its `--help` output.
+Reading one byte at a time is slow but simple; for a 258,048-byte area
+on an image file it took about a third of a second. Area offsets and
+lengths are multiples of 4096 bytes, so the same bytes can be read in
+512-byte blocks by dividing both numbers by 512, for example
+`bs=512 skip=64 count=504` for an area at 32768 of length 258048.
+
+`scripts/inspect-keyslot` computes the range and runs the extraction
+for you; see its `--help`. It currently requires root, even for an
+image file.
 
 ## What healthy key material looks like
 
-A keyslot's `area` holds AF-striped, encrypted key material (see
-[AF-splitting](luks2-header-anatomy.md#af-splitting-anti-forensic-splitting),
-or [`af-splitting-explained.md`](af-splitting-explained.md) for a
-byte-by-byte worked example of why this makes partial damage
-unrecoverable).
-Correctly written, this data is **cryptographically indistinguishable
-from uniform random noise** — there is no structure, no repeating
-pattern, no predictable byte at any position. That's expected and
-correct, not a red flag.
+A keyslot's area holds the keyslot's AF-split copy of the master key,
+encrypted with the area cipher (see
+[`af-splitting-explained.md#what-is-written-to-disk`](af-splitting-explained.md#what-is-written-to-disk)).
+Ciphertext looks like uniformly random bytes, with no structure and no
+repeating pattern. The part of the area after the key material is
+random too: cryptsetup fills the whole keyslots area with random data
+when it formats the device (see
+[`luks2-header-anatomy.md#reading-area-offset--area-length`](luks2-header-anatomy.md#reading-area-offset--area-length)).
 
-A healthy dump looks like this (synthetic example, not a real keyslot):
+The first 128 bytes of a keyslot area on a freshly formatted test
+image:
 
 ```
-00000000: 390c 8c7d 7247 342c d810 0f2f 6f77 0d65  9..}rG4,.../ow.e
-00000010: d670 e58e 0351 d8ae 8e4f 6eac 342f c231  .p...Q...On.4/.1
-00000020: b7b0 8716 eb3f c128 96b9 6223 1774 9428  .....?.(..b#.t.(
-00000030: 7733 c28e e8ba 53bd b56b 8824 577d 53ec  w3....S..k.$W}S.
-00000040: c28a 70a6 1c75 10a1 cd89 216c a16c ffca  ..p..u....!l.l..
-00000050: ea49 8747 7e86 dbcc b970 46fc 2e18 384e  .I.G~....pF...8N
-00000060: 51d8 20c5 c3ef 8005 3a88 ae39 96de 50e8  Q. .....:..9..P.
-00000070: 0186 5b36 9865 4ebf 5200 a5fa 0939 b99d  ..[6.eN.R....9..
+00000000: 1e27 2e29 cc80 7b78 8358 6545 b79c 63a2  .'.)..{x.XeE..c.
+00000010: 4162 802f d3b8 0465 50a2 fd7e 96ba 7823  Ab./...eP..~..x#
+00000020: 2325 17ef d357 6d8d e841 ad46 d79c 90de  #%...Wm..A.F....
+00000030: 5a67 cd7e 277a a4ce 43a0 c6f6 5521 481c  Zg.~'z..C...U!H.
+00000040: a1dc 105a ea1e bf88 8fd0 78a0 8551 6c04  ...Z......x..Ql.
+00000050: 7c5d 08e8 b002 e191 2261 eb63 fb4d c86a  |]......"a.c.M.j
+00000060: be79 8b04 6753 b2db 81c4 74ee da83 5254  .y..gS....t...RT
+00000070: 628a 9e94 9317 f5db 410d a2ec 520e 037e  b.......A...R..~
 ```
 
-What makes this "look healthy" to the eye:
+What to look for:
 
-- No byte value dominates — you don't see long runs of `00`, `ff`, or
-  any other single byte.
-- No repeating multi-byte pattern (e.g. the same 4 or 8 bytes recurring
-  every N bytes) — that would suggest something got overwritten with a
-  fill pattern or a cyclic buffer artifact rather than real ciphertext.
-- The ASCII column on the right is uniformly full of `.` (non-printable)
-  with only sporadic, coincidental printable characters — real
-  ciphertext will never spell out meaningful text, but occasional
-  single printable bytes purely by chance are normal and expected in
-  high-entropy data.
+- No byte value dominates; no long runs of `00`, `ff` or any other
+  single byte.
+- No multi-byte pattern repeating at a fixed interval.
+- The ASCII column shows scattered printable characters by chance, but
+  never readable text.
 
-This is the pattern `scripts/inspect-keyslot`'s heuristic check is
-built around — see that script's `--help` for exactly what it flags.
+These are the patterns `scripts/inspect-keyslot`'s two checks are
+built around; see its `--help` for what it flags and at which
+thresholds.
 
 ## What corrupted key material looks like
 
-By contrast, here's what actual damage tends to look like (again,
-synthetic — generated to illustrate failure patterns, not a real dump).
+cryptsetup's man page says keyslot damage "can happen due to storage
+media failure or overwriting the keyslot area with other data"
+([`cryptsetup-repair(8)`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/bae21790d59897ac50e5471f953f76b3a58aeeb6/man/cryptsetup-repair.8.adoc)).
+Overwriting leaves a visible trace when what was written is not random.
+The two dumps below come from the experiment, which damaged 4096 bytes
+of a keyslot area starting 8192 bytes in; each shows the 32 bytes
+before the damage and the first 64 damaged bytes.
 
-**Truncation / zero-fill from an interrupted write** (e.g. a USB
-enclosure disconnecting mid-write, a failed sector remap, or a
-partial `dd` that didn't complete):
+**A zeroed block:**
 
 ```
-00000000: 390c 8c7d 7247 342c d810 0f2f 6f77 0d65  9..}rG4,.../ow.e
-00000010: d670 e58e 0351 d8ae 8e4f 6eac 342f c231  .p...Q...On.4/.1
-00000020: b7b0 8716 eb3f c128 96b9 6223 1774 9428  .....?.(..b#.t.(
+00000000: 0e6a 5fac 387e bcfd 19e7 b0a5 57a4 80c5  .j_.8~......W...
+00000010: 5be2 aed3 e945 f7fe 71fa 4775 0b63 342f  [....E..q.Gu.c4/
+00000020: 0000 0000 0000 0000 0000 0000 0000 0000  ................
 00000030: 0000 0000 0000 0000 0000 0000 0000 0000  ................
 00000040: 0000 0000 0000 0000 0000 0000 0000 0000  ................
 00000050: 0000 0000 0000 0000 0000 0000 0000 0000  ................
-00000060: 0000 0000 0000 0000 0000 0000 0000 0000  ................
-00000070: 0000 0000 0000 0000 0000 0000 0000 0000  ................
 ```
 
-The first 48 bytes look normal (high entropy), then it drops into a
-long, unbroken run of `00` and never recovers. This is the signature of
-a write that started correctly and then stopped — the drive (or
-enclosure, or cable) dropped out partway through, and everything after
-that point is unwritten/zeroed rather than real ciphertext.
-
-**Repeating pattern from a fill/wipe tool or overwritten region**:
+**A repeated fill pattern** (here `de ad be ef`):
 
 ```
-00000000: 390c 8c7d 7247 342c d810 0f2f 6f77 0d65  9..}rG4,.../ow.e
-00000010: deadbeef deadbeef deadbeef deadbeef       ................
-00000020: deadbeef deadbeef deadbeef deadbeef       ................
-00000030: deadbeef deadbeef deadbeef deadbeef       ................
+00000000: 0e6a 5fac 387e bcfd 19e7 b0a5 57a4 80c5  .j_.8~......W...
+00000010: 5be2 aed3 e945 f7fe 71fa 4775 0b63 342f  [....E..q.Gu.c4/
+00000020: dead beef dead beef dead beef dead beef  ................
+00000030: dead beef dead beef dead beef dead beef  ................
+00000040: dead beef dead beef dead beef dead beef  ................
+00000050: dead beef dead beef dead beef dead beef  ................
 ```
 
-A short, exactly-repeating multi-byte pattern like this is not
-something real ciphertext produces — it's the signature of a fill
-pattern, whether from a diagnostic tool, a buggy driver zero/pattern-
-filling unread sectors, or (rarely) deliberate overwriting.
+Random bytes do produce short runs and repeats by chance, more often
+the larger the area, so a short run on its own proves nothing; what
+matters is a run or pattern too long to be chance.
+`scripts/inspect-keyslot`'s thresholds are rough; for a statistical
+treatment, see [`entropy-analysis.md`](entropy-analysis.md).
 
-**Important caveat**: a *single* short run of zeros, or one coincidental
-repeated byte pair, is not automatically damning — real random data
-does occasionally produce short coincidental runs by chance, especially
-in a large keyslot area (hundreds of KB). What matters is runs and
-patterns that are implausibly long to occur by chance, or that persist
-across a large fraction of the area. This is why the heuristics in
-`scripts/inspect-keyslot` are explicitly rough visual aids with
-thresholds, not a rigorous statistical entropy test — for anything
-approaching a real forensic determination, use a proper entropy/chi-
-squared analysis tool, not this project.
+cryptsetup also checks for this kind of damage itself: `cryptsetup
+repair` looks for low-entropy regions in keyslot areas and prints a
+warning with the suspect offsets. For both dumps above it printed:
 
-**A more fundamental limitation, not just a caveat**: both heuristics
-(long zero-runs, repeating patterns) only catch damage that leaves a
-*structural* signature — a write that stopped partway, or a region that
-got overwritten with a fill pattern. Neither one, nor any visual or
-statistical inspection method, can catch a single flipped bit (or a
-handful of flipped bits) scattered through otherwise-intact key
-material. Because of AF-splitting's diffusion step (SHA-256 by
-default), a single bit flip anywhere in the stripe data still produces
-output that's statistically indistinguishable from correct, healthy
-noise — see
-[`af-splitting-explained.md`](af-splitting-explained.md#what-damage-does-to-the-key)
-for a worked demonstration of exactly why.
+```
+Keyslot 0 binary data could be corrupted.
+  Suspected offset: 0xa000
+  Suspected offset: 0xa080
+  Suspected offset: 0xa100
+  Subsequent suspected offsets are suppressed.
+You can use hexdump -v -C -n 128 -s <offset_0xXXXX> "<tmpdir>/c1.img" to inspect the data.
+```
 
-This isn't a gap this project's tooling happens to have — it's a gap
-**LUKS2 itself has**, and it's worth being precise about exactly where,
-because LUKS2 is not uniformly undefended:
+`0xa000` is the area's offset (32768) plus 8192. The check "prints only
+warnings. It does not modify keyslots", it can give false positives,
+and it detects "usually only a low-entropy area (like zeroed blocks)"
+([`cryptsetup-repair(8)`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/bae21790d59897ac50e5471f953f76b3a58aeeb6/man/cryptsetup-repair.8.adoc)).
+In the experiment, `repair` still exited with status 0.
 
-- **The binary header + JSON metadata area**: has a real integrity
-  check. The `csum` field (see
-  [`luks2-header-anatomy.md#the-binary-header-byte-by-byte`](luks2-header-anatomy.md#the-binary-header-byte-by-byte))
-  is a SHA-256 checksum over the whole header+JSON region, and it's
-  exactly what `cryptsetup repair` validates and can resync from the
-  redundant secondary copy if the primary's checksum fails. This region
-  is *not* undefended.
-- **The keyslot key-material `area`**: **no checksum, no parity, no ECC,
-  nothing** — categorically, by design, not as an oversight. There is
-  no field anywhere in the LUKS2 format that could tell you "this
-  keyslot's bytes are damaged" independent of actually trying to derive
-  and unwrap a key from them. Given AF-splitting's anti-forensic goal
-  (a partially-recovered keyslot must reveal nothing), this is
-  arguably the *correct* design choice, not an accidental gap — adding
-  a checksum over the stripe data would itself be a small structural
-  leak about which bytes are "real."
-- **The encrypted data segment** (your actual files): unprotected by
-  default, same as the keyslot area — but, unlike the keyslot area,
-  this one is optional to fix. `cryptsetup luksFormat --integrity
-  hmac-sha256` (or an AEAD cipher mode) layers `dm-integrity`
-  underneath `dm-crypt`, adding a per-sector authentication tag so
-  corrupted or tampered data blocks are detected on read. This has
-  real space and performance overhead and is **not the default** — most
-  LUKS2 volumes, including the one this project's recovery script was
-  originally built for, don't use it. If you're setting up a new
-  volume and data-corruption detection matters to you, `--integrity` is
-  the mechanism to look at; it's out of scope for this project's
-  existing-volume diagnostic tooling.
+## What no inspection can detect
 
-So: no single answer covers all of LUKS2 — the header is checksummed,
-the keyslot area is permanently and deliberately unchecksummable, and
-the data segment is checksummable but usually isn't checksummed. If you
-suspect subtle bit-level corruption (a failing drive with silent read
-errors, for instance) in a keyslot's key material specifically, these
-heuristics won't tell you either way; your only real defense there is a
-`luksHeaderBackup` taken before the damage occurred.
+Damage that replaces ciphertext with other random-looking bytes leaves
+no trace. A single changed byte, or a block overwritten with random
+data or with other ciphertext, still looks like ciphertext: neither a
+hex dump, `scripts/inspect-keyslot`, a statistical test nor `cryptsetup
+repair` can tell it from intact data. In the experiment, one changed
+byte in the area produced no warning from `repair`, while
+`open --test-passphrase` failed. How much of the key such damage
+destroys is worked out in
+[`af-splitting-explained.md#what-damage-does-to-the-key`](af-splitting-explained.md#what-damage-does-to-the-key):
+at least 128 bits, far too many to search.
+
+What LUKS2 checks, region by region:
+
+- **The binary header and JSON metadata** carry a checksum over each
+  copy (see
+  [`luks2-header-anatomy.md#the-binary-header-byte-by-byte`](luks2-header-anatomy.md#the-binary-header-byte-by-byte)),
+  and there are two copies, so accidental damage to one is detected
+  and repaired from the other. The checksum does not protect against
+  deliberate changes.
+- **The keyslot areas** have no checksum of their own. The only check
+  is the master-key digest, which runs after a keyslot has been
+  decrypted and merged
+  ([`af-splitting-explained.md#how-a-wrong-key-is-detected`](af-splitting-explained.md#how-a-wrong-key-is-detected)).
+  It tells you the result is not the right key, but not whether the
+  passphrase was wrong or the keyslot is damaged: cryptsetup prints
+  "No key available with this passphrase." in both cases.
+- **The data segment** is not checked by default. `luksFormat
+  --integrity` adds a per-sector authentication tag through an
+  underlying dm-integrity device, so damaged or altered data sectors
+  are detected when read. cryptsetup marks this "*EXPERIMENTAL*", it
+  costs space and speed, and it has to be chosen when the volume is
+  created (`--integrity` in
+  [`man/common_options.adoc`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/bae21790d59897ac50e5471f953f76b3a58aeeb6/man/common_options.adoc),
+  lines 362–368, and "Authenticated disk encryption (EXPERIMENTAL)" in
+  [`man/cryptsetup.8.adoc`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/bae21790d59897ac50e5471f953f76b3a58aeeb6/man/cryptsetup.8.adoc),
+  lines 566–573).
+
+So if a keyslot that used to work stops accepting a passphrase you are
+sure of and nothing looks wrong, inspection cannot settle whether the
+keyslot is damaged. Another keyslot, or a header backup taken before
+the problem, is the way back in.
 
 ## Diffing primary vs. secondary headers
 
-Extract both headers the same way:
+With the default layout, the binary headers are at 0 and 16384 and
+the JSON areas at 4096 and 20480, each 12288 bytes. If the primary
+header's `hdr_size` (see
+[`luks2-header-anatomy.md`](luks2-header-anatomy.md#the-binary-header-byte-by-byte))
+is not 16384, use that value as the secondary's offset and
+`hdr_size` − 4096 as the JSON size.
 
 ```
 sudo dd if=/dev/sdX bs=1 skip=0     count=4096 2>/dev/null | xxd > primary-header.hex
@@ -266,29 +260,32 @@ sudo dd if=/dev/sdX bs=1 skip=16384 count=4096 2>/dev/null | xxd > secondary-hea
 diff primary-header.hex secondary-header.hex
 ```
 
-You will get a large diff — **this is expected**, not a symptom. As
-covered in
-[`luks2-header-anatomy.md#primary-vs-secondary-header-legitimate-differences`](luks2-header-anatomy.md#primary-vs-secondary-header-legitimate-differences),
-the two headers legitimately differ in their magic bytes (`LUKS` vs.
-`SKUL`, byte-reversed), their independent checksums, their independent
-random salts, and the secondary header's self-referential offset field.
+The binary headers always differ, in exactly four fields: `magic`,
+`salt`, `hdr_offset` and `csum` (see
+[`luks2-header-anatomy.md#primary-vs-secondary-header-legitimate-differences`](luks2-header-anatomy.md#primary-vs-secondary-header-legitimate-differences)).
+Any other difference is worth a closer look.
 
-What you're actually checking for here is not "are these identical"
-(they never are) but:
+The JSON areas should be identical:
 
-1. **Does `cryptsetup luksDump` succeed and show consistent JSON content
-   from both?** Run `cryptsetup luksDump` normally — it reads and
-   validates the primary header by default, falling back to the
-   secondary automatically if the primary fails checksum validation.
-   If it succeeds without warning, both headers are at least internally
-   valid.
-2. **Does the JSON payload (keyslots, digests, segments) match in
-   substance between primary and secondary?** The binary header framing
-   differs by design; the *meaning* of the metadata should not. A
-   difference here — a different number of keyslots, a different
-   segment offset, a keyslot present in one but not the other — is a
-   genuine red flag suggesting the two copies have drifted (e.g. from a
-   crash during a metadata-modifying operation like `luksAddKey`).
+```
+sudo dd if=/dev/sdX bs=1 skip=4096  count=12288 2>/dev/null > primary.json
+sudo dd if=/dev/sdX bs=1 skip=20480 count=12288 2>/dev/null > secondary.json
+cmp primary.json secondary.json
+```
+
+Two things to keep in mind:
+
+- **Running cryptsetup can change what you are comparing.** When one
+  copy is damaged, `luksDump`, `open` and `repair` each rewrite it from
+  the other valid copy, without printing anything (shown in the
+  experiment, and by
+  [`experiments/header-anatomy/`](../experiments/header-anatomy)). So
+  `luksDump` succeeding does not mean both copies were valid, and if
+  you want to see the damage itself, extract both copies before running
+  any cryptsetup command on the device, or work on an image.
+- **If both copies are damaged**, every command fails with "Device
+  /dev/sdX is not a valid LUKS device." The fix is to restore a header
+  backup.
 
 ## When to run `cryptsetup repair`, and what it can't fix
 
@@ -296,96 +293,74 @@ What you're actually checking for here is not "are these identical"
 sudo cryptsetup repair /dev/sdX
 ```
 
-**What success looks like** — `repair` found nothing wrong, or fixed
-something and reports it, then exits quietly with status 0:
+`repair` "Tries to repair the device metadata if possible", for "some
+known benign LUKS metadata header corruptions. Only basic corruptions
+of unused keyslot are fixable. This command will only change the LUKS
+header, not any keyslot data." It also upgrades or recovers LUKS2
+re-encryption metadata, which needs a passphrase
+([`cryptsetup-repair(8)`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/bae21790d59897ac50e5471f953f76b3a58aeeb6/man/cryptsetup-repair.8.adoc)).
+The man page recommends taking a header backup first.
 
-```
-$ sudo cryptsetup repair /dev/sdX
-$ echo $?
-0
-```
+What it printed in the experiment:
 
-Don't be alarmed by the lack of output on a clean header — silence means
-"nothing to do," not "didn't run." If it actually resyncs a header copy,
-it prints a line saying so before exiting 0.
+| Situation | Output | Exit status |
+|---|---|---|
+| Intact device | nothing | 0 |
+| Primary header damaged | nothing (it rewrote the primary header) | 0 |
+| Keyslot area zeroed or pattern-filled | the "binary data could be corrupted" warning above | 0 |
+| One byte of a keyslot area changed | nothing | 0 |
+| Both header copies damaged | `Device ... is not a valid LUKS device.` | 1 |
 
-**What failure looks like** — a non-zero exit and an explicit error
-naming what it couldn't reconcile, e.g.:
+So exit status 0 does not mean the keyslots are intact; read any
+warnings it prints.
 
-```
-$ sudo cryptsetup repair /dev/sdX
-Device size is not aligned to requested sector size alignment (4096 bytes).
-$ echo $?
-1
-```
+**What it does not fix:**
 
-or a message that both header copies are damaged beyond repair. If you get
-an error here instead of quiet success, `repair` did not fix your header —
-proceed to a header restore from backup (see the decision guide below), or
-treat the structural damage as unrecovered.
-
-**What it fixes**: structural damage to the JSON metadata area — e.g.
-a JSON document that fails to parse, a checksum mismatch on one header
-copy that can be repaired by resyncing from the other valid copy, or
-certain known-inconsistent leftover states from an interrupted
-`cryptsetup` operation (like a crashed re-encryption). It only touches
-metadata structure — think of it as filesystem-check-for-the-header,
-not a general data-recovery tool.
-
-**What it does NOT fix**:
-
-- **Corrupted keyslot key material.** If the AF-striped bytes in a
-  keyslot's `area` are themselves damaged (zeroed, truncated,
-  overwritten), `repair` cannot regenerate them — that data, if not
-  recoverable from a header backup or the volume's other keyslots, is
-  gone. This is the anti-forensic property working as intended (see
-  [AF-splitting](luks2-header-anatomy.md#af-splitting-anti-forensic-splitting)) —
-  it does not distinguish "attacker trying to partially erase a slot"
-  from "innocent bit rot," so it protects against both equally
-  effectively, for better and worse.
-- **A wrong passphrase.** `repair` operates purely on structure — it has
-  no way to know or guess your passphrase, and a passphrase being wrong
-  produces a header/keyslot region that is completely well-formed from
-  `repair`'s point of view. If your header inspects as clean and
-  `repair` finds nothing to do, and the volume still won't unlock, the
-  passphrase itself is the leading suspect. That's the scenario
-  [`passphrase-recovery.md`](passphrase-recovery.md) covers.
+- **Damaged keyslot data.** `repair` does not change keyslot data, and
+  a damaged keyslot cannot be rebuilt from what is left of it (see
+  [What no inspection can detect](#what-no-inspection-can-detect)). The
+  man page: "if the keyslot is corrupted, no recovery is possible. You
+  have to use the LUKS header backup." Another working keyslot also
+  still opens the volume.
+- **A wrong passphrase.** A wrong passphrase leaves the header and
+  keyslots intact, so `repair` has nothing to find. If the header and
+  keyslots check out and the volume still won't open, the passphrase is
+  the leading suspect; see [`passphrase-recovery.md`](passphrase-recovery.md).
 
 ## Decision guide
 
-Work through these in order:
+Work through these in order, after taking a header backup (or working
+on an image of the device).
 
-1. **Does `cryptsetup luksDump /dev/sdX` succeed cleanly?**
-   - No, checksum/JSON error → try `sudo cryptsetup repair /dev/sdX`,
-     then re-run `luksDump`. If it now succeeds, proceed to step 2. If
-     it still fails and you have a `luksHeaderBackup` file taken before
-     the damage occurred, restore it:
+1. **Does `cryptsetup luksDump /dev/sdX` work?**
+   - No, it says the device "is not a valid LUKS device": first make
+     sure it is the right device ([above](#confirm-you-have-the-right-device)).
+     If it is, both header copies are damaged, and `repair` cannot fix
+     that. Restore a header backup taken before the damage:
      ```
      sudo cryptsetup luksHeaderRestore /dev/sdX --header-backup-file ./header-backup.img
      ```
-     This overwrites the device's current header region with the
-     backup's — only run it against a backup you're confident predates
-     the damage, since it discards whatever header state is currently
-     on disk (including any keyslots added or changed since that
-     backup was taken). Re-run `luksDump` afterward to confirm. Without
-     a pre-damage backup, structural damage that `repair` can't fix is
-     very likely unrecoverable.
-   - Yes → proceed to step 2.
+     "All keyslots will be replaced; only the passphrases from the
+     backup will work afterward"
+     ([`cryptsetup-luksHeaderRestore(8)`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/bae21790d59897ac50e5471f953f76b3a58aeeb6/man/cryptsetup-luksHeaderRestore.8.adoc)),
+     so use a backup you know belongs to this device. Without a backup,
+     the volume cannot be opened.
+   - Yes: go to step 2. (If one header copy was damaged, cryptsetup has
+     already rewritten it from the other.)
 
-2. **Does the target keyslot's `area` show visible corruption when
-   dumped with `dd`+`xxd`** (long zero-runs, repeating patterns,
-   obvious truncation, per the examples above)?
-   - Yes → the keyslot's key material is likely damaged. Check whether
-     another keyslot on the same device is intact (a volume can have
-     multiple independent keyslots), or whether you have a
-     `luksHeaderBackup` file predating the damage. Without one of
-     those, this keyslot is very likely unrecoverable — that's the
-     nature of AF-splitting.
-   - No, it looks like uniform high-entropy noise → proceed to step 3.
+2. **Does `cryptsetup repair` warn that a keyslot's binary data could
+   be corrupted, or does a dump of the keyslot's area show long runs of
+   one byte or a repeating pattern?**
+   - Yes: that keyslot is probably damaged and cannot be repaired. Use
+     another keyslot whose passphrase you know, or restore a header
+     backup taken before the damage.
+   - No: go to step 3.
 
-3. **Header structurally sound, keyslot data looks clean, but the
-   volume still won't unlock with the passphrase you're using?**
-   - This strongly suggests the passphrase itself is wrong — a typo, a
-     dropped character, a wrong special-character variant — not disk
-     damage. See [`passphrase-recovery.md`](passphrase-recovery.md) for
-     a bounded, safe search technique for exactly this situation.
+3. **The header and keyslots look fine, but the volume won't open with
+   your passphrase.** The most likely cause is the passphrase: a typo,
+   a missing character, a different special character. See
+   [`passphrase-recovery.md`](passphrase-recovery.md) for a bounded,
+   safe search. Damage that inspection cannot see (see
+   [What no inspection can detect](#what-no-inspection-can-detect))
+   produces the same symptom, so if the search finds nothing, another
+   keyslot or a header backup is the remaining option.
