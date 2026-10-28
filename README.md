@@ -25,13 +25,14 @@ It is deliberately **not**:
   [`docs/passphrase-recovery.md`](docs/passphrase-recovery.md) for why
   Argon2id makes that intractable by design, and why this tool only
   covers the "I'm 95% sure of this passphrase" case.
-- A comparison of LUKS1 vs. LUKS2, or coverage of other disk-encryption
-  formats (BitLocker, VeraCrypt, TrueCrypt, etc.). Scope here is LUKS2,
-  specifically.
-- A tool that recovers data when the keyslot's key material is actually
-  corrupted. AF-splitting (explained in the docs) makes partial keyslot
-  damage unrecoverable by design — that's a security property, not a
-  bug, and no amount of clever tooling gets around it.
+- Coverage of LUKS1 or other disk-encryption formats (BitLocker,
+  VeraCrypt, TrueCrypt, etc.). Scope here is LUKS2; LUKS1 comes up only
+  where it explains LUKS2, as in the KDF comparison.
+- A tool that recovers a damaged keyslot. Any damage to a keyslot's
+  stored key material leaves at least 128 bits of the master key
+  unknown, far too many to search (see
+  [`docs/af-splitting-explained.md`](docs/af-splitting-explained.md#what-damage-does-to-the-key));
+  the way back in is another keyslot or a header backup.
 
 The docs are intentionally broader and deeper than the tooling. The
 name was chosen with that in mind: this project's job is to make LUKS2
@@ -58,9 +59,9 @@ its owner was confident about. Working through it methodically:
   sound.
 
 With disk corruption ruled out, the remaining explanation was a
-slightly-wrong passphrase. A bounded search over every single-character
-substitution (QWERTY-adjacency and shift/symbol confusion), deletion,
-and insertion — verified safely via `cryptsetup open --test-passphrase`,
+slightly-wrong passphrase. A bounded search over single-character
+substitutions (QWERTY neighbours and shift/symbol pairs), deletions and
+insertions — verified safely via `cryptsetup open --test-passphrase`,
 which checks a passphrase without activating the device — found the
 actual passphrase: one character shorter than the confident guess, most
 likely a keystroke that hadn't registered when it was originally set.
@@ -73,11 +74,12 @@ and the recovery tool — for anyone in the same situation.
 LUKS2 protects data with a single random **master key**, never derived
 from a passphrase, wrapped separately in one or more **keyslots** so
 multiple passphrases (or other credentials) can unlock the same volume
-without re-encrypting anything. Each keyslot's key material is
-protected by **Argon2id**, a memory-hard key-derivation function chosen
-specifically because it resists GPU/ASIC-accelerated brute-forcing far
-better than LUKS1's PBKDF2 — every guess costs real time *and* real
-memory, not just CPU cycles.
+without re-encrypting anything. By default, the key that encrypts each
+keyslot is derived from its passphrase with **Argon2id**, a
+memory-hard key derivation function: every guess costs time *and*
+memory, which makes large-scale guessing on GPUs much less effective
+than against LUKS1's PBKDF2 (see
+[`docs/kdf-comparison.md`](docs/kdf-comparison.md)).
 
 Before being encrypted and written to disk, a keyslot's copy of the
 master key is **AF-split** (anti-forensic split) into 4000 stripes,
@@ -108,12 +110,13 @@ and secondary headers legitimately differ — is in
   sector, how it is wiped on close, and a source-verified call graph of
   that lifecycle.
 - [`docs/checking-for-corruption.md`](docs/checking-for-corruption.md) —
-  practical `dd`/`xxd` inspection walkthrough, healthy vs. corrupted
-  example dumps, when `cryptsetup repair` helps and when it can't, and
-  a step-by-step decision guide.
+  practical `dd`/`xxd` inspection walkthrough, real healthy and
+  damaged dumps, what `luksDump`, `repair` and `--test-passphrase`
+  report for each kind of damage, what no inspection can detect, and a
+  step-by-step decision guide.
 - [`docs/passphrase-recovery.md`](docs/passphrase-recovery.md) — the
-  edit-distance-1 methodology in detail, why it's safe, and its
-  explicit limits.
+  edit-distance-1 search in detail, why it's safe, and which slips it
+  does and does not recover.
 - [`docs/cold-boot-and-dma-attacks.md`](docs/cold-boot-and-dma-attacks.md) —
   a deliberately separate threat model: attacking the cleartext master
   key while it's resident in memory on an already-unlocked, running
@@ -122,11 +125,15 @@ and secondary headers legitimately differ — is in
   and don't actually help.
 - [`docs/entropy-analysis.md`](docs/entropy-analysis.md) — quantitative
   chi-squared/entropy/NIST-SP-800-22 analysis of keyslot data: what
-  statistical testing can and provably cannot detect about corruption,
-  backed by real experiments against real AF-split output.
+  statistical testing can and cannot detect about damage, measured on
+  real on-disk keyslot areas.
 - [`docs/kdf-comparison.md`](docs/kdf-comparison.md) — Argon2id vs.
   PBKDF2 grounded in the actual specs, cryptsetup's source, and real
   published GPU cracking-speed benchmarks.
+
+[`experiments/`](experiments) holds the reproducible experiments behind
+the docs' claims: each has a `run` script, needs no root, works on
+throwaway image files, and records the output it produced.
 
 ## Usage
 
@@ -138,8 +145,9 @@ sudo ./scripts/inspect-keyslot /dev/sdX
 
 Prompts for which keyslot to inspect if the volume has more than one,
 computes the byte range from `luksDump` automatically (no manual offset
-arithmetic), dumps the head/tail of the raw keyslot area, and runs a
-rough zero-run heuristic as a visual aid. See
+arithmetic), dumps the head/tail of the raw keyslot area, and runs two
+rough heuristics, for long zero runs and short repeating patterns, as
+visual aids. See
 [`docs/checking-for-corruption.md`](docs/checking-for-corruption.md)
 for how to interpret the output.
 
@@ -152,13 +160,17 @@ sudo ./scripts/inspect-keyslot --slot 0 /dev/sdX
 
 ```
 sudo ./scripts/recover-passphrase /dev/sdX 'my-best-guess-passphrase'
+./scripts/recover-passphrase ./device.img 'my-best-guess-passphrase'
 ```
 
-Generates every substitution/deletion/insertion candidate at edit
-distance 1 from your guess and tests each safely with
-`cryptsetup open --test-passphrase` (never activates the device). See
-[`docs/passphrase-recovery.md`](docs/passphrase-recovery.md) for the
-full walkthrough and example output.
+Tests the guess itself, then candidates one edit away from it
+(substitutions by neighbouring keys and shift pairs, deletions, and
+insertions of digits and common symbols), each with
+`cryptsetup open --test-passphrase`, which never activates the device.
+An image file of the device needs no root. It does not cover every
+one-character difference: uppercase slips and missing letters are not
+tried. See [`docs/passphrase-recovery.md`](docs/passphrase-recovery.md)
+for the full walkthrough and real example output.
 
 ```
 ./scripts/recover-passphrase --help
@@ -178,12 +190,16 @@ contributions welcome, but none of these are half-implemented anywhere
 in this repo:
 
 - **Dvorak substitution table.** `recover-passphrase --layout` currently
-  covers `qwerty` (default), `azerty`, and `qwertz` — the three most
-  common physical layouts. Dvorak's fundamentally different key
-  arrangement (optimized for typing efficiency, not physical/historical
-  continuity with QWERTY) would need its own adjacency map built from
-  scratch rather than derived from the QWERTY table, and is left for a
-  future contribution.
+  covers `qwerty` (default), `azerty`, and `qwertz`. Dvorak arranges
+  the keys differently enough that it would need its own adjacency
+  table built from scratch rather than derived from the QWERTY one.
+- **Wider substitution and insertion sets.** Substitution covers only
+  lowercase letters, digits and shift/symbol pairs, and insertion only
+  digits and a few symbols, so an uppercase slip or a missing letter
+  is not found (see
+  [`experiments/passphrase-recovery/`](experiments/passphrase-recovery)).
+  Covering them, including case changes, would multiply the number of
+  candidates, each costing about 2 seconds with default Argon2id.
 - **Dictionary/mnemonic-based candidate generation.** For passphrases
   built from a memorable phrase or word list, generating candidates
   from likely word substitutions or common transformations (leetspeak,
@@ -212,9 +228,10 @@ in this repo:
   auditable and dependency-free but means candidate generation is
   inherently slower than a compiled implementation, which matters as
   search space grows (edit-distance-2, transposition, dictionary
-  search — all listed above). Scoping work would need to weigh: startup
-  overhead per `cryptsetup open --test-passphrase` call likely dominates
-  actual wall-clock time regardless of language; whether a rewrite
+  search — all listed above). Scoping work would need to weigh: each
+  `cryptsetup open --test-passphrase` call spends about 2 seconds in
+  Argon2id with default settings, which dominates the run time
+  regardless of language; whether a rewrite
   should shell out to `cryptsetup` as today or link `libcryptsetup`
   directly; and whether it's worth the loss of "read the whole script in
   one sitting" auditability that POSIX `sh` currently provides for a
@@ -240,14 +257,13 @@ that either doc is itself a scoped feature to implement directly:
   `inspect-keyslot`'s current heuristics (see
   [`docs/af-splitting-explained.md`](docs/af-splitting-explained.md))
   are visual/structural — zero-run length, repeating-pattern detection
-  — explicitly *not* a statistical measure, and explicitly incapable of
-  catching single-bit-flip corruption (diffusion makes that
-  information-theoretically invisible, not just hard to detect).
+  — explicitly *not* a statistical measure, and incapable of catching
+  damage that leaves random-looking bytes, such as flipped bits: a
+  keyslot area is ciphertext, and so is what such damage leaves.
   **Done**: see [`docs/entropy-analysis.md`](docs/entropy-analysis.md)
-  for the deep-dive into entropy/randomness-deficit calculation
-  (chi-squared, NIST SP 800-22, Shannon entropy) against real
-  AF-striped keyslot data, establishing precisely what such analysis
-  *can* and *definitively cannot* detect.
+  for chi-squared, NIST SP 800-22 and Shannon entropy tests run on
+  real on-disk keyslot areas, intact and damaged, and what each test,
+  `inspect-keyslot` and `cryptsetup repair` catch.
 - **Argon2id vs. PBKDF2 comparison, LUKS1 vs. LUKS2, done
   cryptographically.** A rigorous comparison — memory-hardness
   properties, GPU/ASIC attack cost modeling, actual information
@@ -282,11 +298,15 @@ that either doc is itself a scoped feature to implement directly:
 
 ## Contributing
 
-Issues and pull requests are welcome. Shell scripts should pass
-`shellcheck` and follow the existing style (`set -euo pipefail`,
-explicit `--help`, clear argument validation, comments only where the
-*why* isn't obvious from the code itself). Documentation changes should
-match the depth and structure of the existing `docs/` files.
+Issues and pull requests are welcome. Shell scripts are strict POSIX
+`sh`, should pass `shellcheck --shell=sh`, and follow the existing
+style (`set -eu`, explicit `--help`, clear argument validation,
+comments only where the *why* isn't obvious from the code itself, and
+an SPDX license line with a copyright notice at the top).
+Documentation changes should match the depth and structure of the
+existing `docs/` files, cite their sources with commit-pinned links and
+section or page numbers, and back measurable claims with an experiment
+in [`experiments/`](experiments).
 
 ## License
 
