@@ -378,33 +378,52 @@ project — see `docs/passphrase-recovery.md`.
 
 ## AF-splitting (anti-forensic splitting)
 
-Before a keyslot's key material is encrypted and written to its `area`
-on disk, LUKS applies **AF-splitting** (anti-forensic splitting, an
-algorithm inherited unchanged from LUKS1). This is a *diffusion* step,
-not encryption — the goal is different from confidentiality:
+Before a keyslot's copy of the master key is encrypted and written to
+its `area` on disk, LUKS2 expands it with **AF-splitting**
+(anti-forensic splitting), the same algorithm LUKS1 uses: "only the
+luks1 type is currently used", and that type is "compatible with
+LUKS1"
+([LUKS2 spec v1.1.4](https://gitlab.com/cryptsetup/LUKS2-docs/-/blob/a81aa2fef8d176debdbec297c1e0b74bb50cfee8/luks2_doc_wip.pdf)
+§3.2, p.9, and §3.2.4, p.10). The key is split first and the result is encrypted
+(§4.2, p.14). Splitting is not encryption; its purpose is to make the
+keyslot erasable.
 
-AF-splitting takes the (typically 512-bit) unwrapped key and expands it
-into many "stripes" (4000 by default — see the `af.stripes` field in
-the JSON) such that:
+AF-splitting expands an *N*-byte key (64 bytes with the default
+`aes-xts-plain64`) into 4000 stripes of *N* bytes each. LUKS2 supports
+no other stripe count ("for historical reasons only the 4000 value is
+supported", §3.2.4, p.10), recorded in the keyslot's `af.stripes`
+field. In cryptsetup's implementation
+([`lib/luks1/af.c`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/fb6b9480fa519c70366d6743ec84cb0f3afcc8c7/lib/luks1/af.c#L91-139)):
 
-- **All stripes are needed to reconstruct the original key.** Losing or
-  corrupting even a single stripe makes the entire keyslot
-  unrecoverable — there is no partial reconstruction.
-- **Each stripe, individually, reveals nothing about the key.** The
-  diffusion uses repeated hashing (the `af.hash` field, typically
-  SHA-256) to mix each stripe with the ones before it, so that only the
-  complete, ordered set of stripes lets you invert the process.
+- **Every stripe is needed to reconstruct the key.** Stripes 1 to 3999
+  are random. Each is XORed into a running accumulator, which is then
+  passed through a hash-based diffusion function (the `af.hash` field,
+  typically SHA-256). That function hashes the accumulator in separate
+  digest-sized chunks (32 bytes for SHA-256), so damage to part of a
+  stripe scrambles only the key chunk it lines up with: one half of a
+  64-byte key. The
+  [LUKS1 specification](https://gitlab.com/cryptsetup/cryptsetup/-/blob/bae21790d59897ac50e5471f953f76b3a58aeeb6/docs/on-disk-format.pdf)
+  records this chunk-by-chunk design as an implementation error
+  (§2.4.1, footnote 4, p.4).
+- **The last stripe is not diffused.** It is the key XORed with the
+  final accumulator, so damage to part of it changes only the matching
+  bytes of the reconstructed key.
 
-**Why this exists as a security feature** (not a bug, and not something
-this project's tooling tries to work around): magnetic and flash media
-do not reliably guarantee that an overwritten sector is truly gone —
-wear-leveling, bad-block remapping, and filesystem journaling can all
-leave forensic remnants of old data behind. If a keyslot were written to
-disk as a single contiguous copy of the (wrapped) key, an attacker who
-recovered even a fragment of an old, "deleted" keyslot region might
-reconstruct a meaningful chunk of key material. AF-splitting means a
-partially-erased or partially-recovered keyslot is cryptographically
-useless — you need every stripe, in order, or you have nothing.
+**Why this exists.** Removing a passphrase means destroying its
+keyslot's encrypted copy of the master key; otherwise anyone who knows
+the old passphrase can still decrypt it (LUKS2 spec §4.4 "Keyslot
+Revocation", p.14). An overwrite can miss a sector that disk firmware
+has remapped to a reserved area, and a 32- or 64-byte key fits in one
+such sector whole. AF-splitting makes the stored copy 4000 times
+larger, so that an overwrite destroys at least one necessary piece
+with high probability (Fruhwirth,
+[*New Methods in Hard Disk Encryption*, 2005](https://clemens.endorphin.org/nmihde/nmihde-A4-ds.pdf)
+§5.2, pdf p.87–89). It does not work on flash storage, where spare
+pools far larger than any keyslot can keep old copies; the LUKS2
+specification calls the splitter "no longer much effective on modern
+storage devices" (§3.2.4, p.10). See
+[`af-splitting-explained.md`](af-splitting-explained.md#the-problem-af-splitting-solves-restated-concretely)
+for the full argument and sources.
 
 **Why this matters when inspecting a keyslot for corruption**: because
 AF-striped, encrypted key material is expected to look like uniform

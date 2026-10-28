@@ -9,10 +9,11 @@ at a hex dump wondering whether a keyslot is corrupted, you understand
 mechanically why the answer is "yes, unrecoverably" rather than taking it
 on faith.
 
-If you haven't read the anatomy doc's AF-splitting section yet, read that
-first — this document assumes you know *why* AF-splitting exists (the
-anti-forensic property: a partially-recovered keyslot must be
-cryptographically useless) and focuses entirely on *how*.
+The anatomy doc's AF-splitting section summarizes what AF-splitting is
+for: making a deleted keyslot unrecoverable even if part of it survives
+the overwrite. The next section states that purpose in detail, with
+sources, including where it falls short; the rest of this document
+covers how the algorithm works.
 
 ## Contents
 
@@ -31,32 +32,96 @@ cryptographically useless) and focuses entirely on *how*.
 
 ## The problem AF-splitting solves, restated concretely
 
-Say your LUKS2 volume's master key is *N* bytes. If that key were
-written to disk as-is — even encrypted under your passphrase-derived
-key — an attacker who recovers even a small *fragment* of that region
-(from wear-leveling remnants on an SSD, a bad-block remap, filesystem
-journal residue, whatever) has a fragment of the actual key. Not the
-whole key, but a real, meaningful piece of it, which measurably narrows
-a brute-force search.
+Each keyslot stores a copy of the volume's master key, encrypted under
+a key derived from that keyslot's passphrase. Removing or changing a
+passphrase therefore means destroying that encrypted copy. If it
+survives anywhere on the device, anyone who knows the old passphrase
+can still decrypt it and recover the master key, and a leaked
+passphrase is often exactly why it is being removed. The LUKS2
+specification requires the keyslot's binary area to be "physically
+overwritten (to discard the stored data)" before its metadata is
+removed
+([LUKS2 spec v1.1.4](https://gitlab.com/cryptsetup/LUKS2-docs/-/blob/a81aa2fef8d176debdbec297c1e0b74bb50cfee8/luks2_doc_wip.pdf)
+§4.4 "Keyslot Revocation", p.14).
 
-AF-splitting's job is to take that *N*-byte key and expand it into many
-"stripes" (4000, by default) such that:
+Overwriting a sector does not guarantee the old data is gone. When a
+sector starts to fail, disk firmware remaps it to a reserved area, and
+the old copy stays there, where no overwrite of the original address
+can reach it. A master key is only 32 or 64 bytes with cryptsetup's
+default key sizes (see the aside below), so its encrypted copy
+fits in a single sector and can survive such a remap whole. Fruhwirth,
+who designed AF-splitting and LUKS, describes this as the problem the
+splitter solves: encrypted key material "is typically very short and
+can be accommodated by a single sector in a reserved remapping zone"
+([*New Methods in Hard Disk Encryption*, 2005](https://clemens.endorphin.org/nmihde/nmihde-A4-ds.pdf)
+§5.2.1, pdf p.87–88). The
+[LUKS1 specification](https://gitlab.com/cryptsetup/cryptsetup/-/blob/bae21790d59897ac50e5471f953f76b3a58aeeb6/docs/on-disk-format.pdf)
+makes the same argument (§1, p.3): the key "can easily be remapped as
+a whole to a reserved area".
 
-- All 4000 stripes, in order, are needed to reconstruct the original key.
-- Any subset smaller than all 4000 — even 3999 of them — reveals
-  **nothing** about the key. Not "a little less secure," not "narrows the
-  search space slightly." Nothing, in the same sense that XORing a secret
-  with one unknown random byte reveals nothing about the secret.
+AF-splitting addresses this by making the stored copy large. It
+expands an *N*-byte key into 4000 stripes of *N* bytes each, 4000 × *N*
+bytes in total (LUKS1 spec §2.4, p.4; LUKS2 supports no other stripe
+count: "for historical reasons only the 4000 value is supported",
+LUKS2 spec §3.2.4, p.10), and the key can only be reconstructed from
+all of them. Fruhwirth's argument is probabilistic (§5.2.2, pdf p.88):
+if each block of data is destroyed by an overwrite with probability
+*p*, independently of the others, all *n* blocks survive with
+probability (1 − *p*)ⁿ, which shrinks
+exponentially as *n* grows. Overwriting a large split keyslot
+therefore destroys at least one necessary piece with high probability,
+even when some sectors escape the overwrite.
 
-That second property is the interesting part, and it's not automatic —
-you get it from a specific construction, not from "spread the data out
-and hope." The rest of this document is that construction, worked
-through with a concrete *N* so you can trace real numbers rather than
-reason about an abstract key. Before picking that *N*, though, it's
-worth being precise about what it actually is — because "the master
-key" is not a fixed-size thing LUKS2 defines once; it's determined by
-choices made at `luksFormat` time, and getting that wrong is exactly
-the kind of imprecision this project's docs are supposed to avoid.
+Exactly what reconstruction needs follows from cryptsetup's
+`AF_split()` and `AF_merge()`
+([`lib/luks1/af.c`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/fb6b9480fa519c70366d6743ec84cb0f3afcc8c7/lib/luks1/af.c#L91-139),
+lines 91–139), traced step by step later in this document:
+
+- Every stripe is needed. If any whole stripe is missing, no byte of
+  the key can be computed.
+- Damage to part of a stripe stays within the hash-sized chunk of the
+  key it lines up with. Each of stripes 1 to 3999 is XORed into a
+  running accumulator, and the accumulator is then passed through
+  `diffuse()` (`af.c` lines 108–109 when splitting, 133–134 when
+  merging). `diffuse()` (lines 54–84) cuts the accumulator into chunks
+  the size of the hash digest (32 bytes for SHA-256) and replaces each
+  chunk with the hash of its index and that chunk alone, so a changed
+  byte scrambles its own chunk and leaves every other chunk unchanged. With a 64-byte key and SHA-256, damage to one byte of stripes
+  1 to 3999 changes one half of the key and leaves the other half
+  intact.
+- The last stripe is not diffused at all. It is XORed with the
+  accumulated result directly (`af.c` line 114 when splitting, line
+  138 when merging), so damage to part of it changes only the matching
+  bytes of the key. Fruhwirth notes this trade-off: "The diffusion of
+  s*n* has to be omitted, as the hash function is not invertible. This
+  degrades security marginally" (§5.2.2, pdf p.89).
+
+The chunk-by-chunk diffusion is not what Fruhwirth designed. His thesis
+builds the diffusion function so that every output chunk hashes the
+whole input, H(q) = h(0 ‖ q) ‖ h(1 ‖ q) ‖ … (§5.2.2, footnote 1,
+pdf p.89). The LUKS1 specification defines that version as "H2" and
+the chunk-by-chunk version LUKS actually uses as "H1", with the note
+"H's function definition stems from an implementation error that I'm
+responsible for … H2 is the correct hash extension as originally
+envisioned" (§2.4.1–2.4.2, pp.4–5).
+
+AF-splitting does not make keyslots erasable on flash storage. SSDs,
+USB sticks, and hybrid or SMR drives redirect writes internally and
+keep old data in spare pools far larger than any keyslot; the
+cryptsetup FAQ gives about 16 GB of spare area for a 240 GB SSD and
+concludes that "fast erase by overwriting the header and key-slot area
+is insecure"
+([FAQ §5.19](https://gitlab.com/cryptsetup/cryptsetup/-/blob/bae21790d59897ac50e5471f953f76b3a58aeeb6/FAQ.md#L1788-1835)).
+The LUKS2 specification says the same of the splitter itself: "The
+LUKS1 AF splitter is no longer much effective on modern storage
+devices. The functionality is here mainly for compatibility reasons"
+(§3.2.4, p.10).
+
+The rest of this document works through the construction with a
+concrete *N*, so you can trace real numbers rather than reason about
+an abstract key. *N* is not a fixed size that LUKS2 defines once; it
+is determined by choices made at `luksFormat` time, which the aside
+below traces through cryptsetup's code.
 
 ### Aside: where does that key-length number actually come from?
 

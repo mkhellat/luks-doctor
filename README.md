@@ -79,10 +79,12 @@ specifically because it resists GPU/ASIC-accelerated brute-forcing far
 better than LUKS1's PBKDF2 — every guess costs real time *and* real
 memory, not just CPU cycles.
 
-Before being written to disk, a keyslot's key material is
-**AF-split** (anti-forensic split) across thousands of stripes, such
-that partial recovery of a damaged or incompletely-erased keyslot
-yields nothing — you need every stripe to reconstruct anything.
+Before being encrypted and written to disk, a keyslot's copy of the
+master key is **AF-split** (anti-forensic split) into 4000 stripes,
+all of which are needed to reconstruct it. The purpose is to make a
+removed keyslot erasable: an overwrite that misses a few sectors still
+destroys the key. This does not hold on SSDs and other flash storage,
+which can keep old copies of a whole keyslot in internal spare areas.
 
 Full depth on all of this — on-disk layout, JSON metadata fields, how
 to compute exact byte ranges from `luksDump` output, why the primary
