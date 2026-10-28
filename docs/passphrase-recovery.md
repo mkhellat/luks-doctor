@@ -1,178 +1,201 @@
 # Passphrase Recovery: Bounded Edit-Distance-1 Search
 
 This document explains the one recovery technique this project
-implements, why it's structured the way it is, and its explicit limits.
-If you haven't already, read
-[`checking-for-corruption.md`](checking-for-corruption.md) first and
-confirm the header and keyslot data both look clean — this tool is for
-the case where the disk itself is fine and the passphrase is the
-problem.
+implements, `scripts/recover-passphrase`, what it searches, and its
+limits. Read [`checking-for-corruption.md`](checking-for-corruption.md)
+first and check that the header and keyslots look intact: this tool is
+for the case where the disk is fine and the passphrase is the problem.
+What the script recovers and what it misses is recorded by
+[`experiments/passphrase-recovery/`](../experiments/passphrase-recovery).
 
-## What this is (and, importantly, what it is not)
+## What this is, and what it is not
 
-**This is not a password cracker.** It does not attempt to guess an
-unknown passphrase from nothing, and it is not a general brute-force
-tool. It is a narrow **recovery aid** for one very specific, very
-common situation: you are highly confident you know the passphrase —
-confident enough to recite it — but the volume won't unlock, and you
-suspect you fat-fingered exactly one character when you originally set
-it, or you're mis-typing exactly one character now.
+**This is not a password cracker.** It does not guess an unknown
+passphrase. It is for one situation: you know the passphrase well
+enough to type it out, the volume won't open, and you suspect that one
+character differs between what you type now and what was set, through
+a slip either then or now.
 
-The scope is deliberately narrow because of how Argon2id works (see
-[`luks2-header-anatomy.md#argon2id`](luks2-header-anatomy.md#argon2id)):
-each single guess against the real keyslot costs a meaningful,
-deliberately-tuned amount of time and memory — that's Argon2id's whole
-purpose, and it's working exactly as intended even when it's
-inconvenient for you. A keyslot configured with `Time cost: 5`,
-`Memory: 1048576` (1 GiB), `Threads: 4` might take on the order of a
-second or more per attempt. That is completely fine for a few hundred
-candidates near a known-good guess. It is hopeless for anything
-resembling a dictionary attack or brute-forcing an unknown passphrase
-from scratch — at even a generous 1 guess/second, testing all
-combinations of a modest keyspace would take longer than is useful to
-anyone. If you don't have a strong, specific guess to start from, this
-tool cannot help you; see the [Roadmap](../README.md#roadmap) in the
-README for what larger-scale approaches would require (GPU-accelerated
-tools like `hashcat`'s LUKS mode, which trade Argon2id's memory-hardness
-advantage against attackers for raw parallel hardware, at real
-financial and time cost).
+The scope is narrow because every guess is expensive. Each test runs
+the keyslot's key derivation function; cryptsetup's default Argon2id
+settings are tuned to take about 2 seconds on the machine that
+formatted the volume (see
+[`luks2-header-anatomy.md#argon2id`](luks2-header-anatomy.md#argon2id)),
+and in the experiment one test took about 1.95 seconds. A few hundred
+guesses near a known passphrase take minutes; searching for an unknown
+passphrase is out of reach this way. If you have no close guess, this
+tool cannot help; see the [Roadmap](../README.md#roadmap) for what
+larger searches would involve, such as GPU tools like hashcat, whose
+7.0.0 release added LUKS2 among its new hash types.
 
-## Why `--test-passphrase` is safe
+## How each guess is tested
 
 ```
-echo -n "$candidate" | cryptsetup open --test-passphrase /dev/sdX
+printf '%s' "$candidate" | cryptsetup open --test-passphrase /dev/sdX
 ```
 
-`--test-passphrase` tells `cryptsetup` to run the passphrase through the
-normal unwrap-and-verify process (derive a key via the keyslot's KDF,
-attempt to unwrap the keyslot, check the result against the volume's
-digest) **without** creating a device-mapper mapping. Concretely, that
-means:
+`--test-passphrase` makes cryptsetup "not activate the device, just
+verify the passphrase"
+([`man/common_options.adoc`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/bae21790d59897ac50e5471f953f76b3a58aeeb6/man/common_options.adoc),
+lines 1040–1041): it derives the keyslot key from the passphrase,
+decrypts and merges the keyslot, and checks the result against the
+master-key digest (see
+[`af-splitting-explained.md#how-a-wrong-key-is-detected`](af-splitting-explained.md#how-a-wrong-key-is-detected)).
+A passphrase read from standard input ends at the first newline
+(`cryptsetup(8)`, "Passphrase processing for LUKS"), so the script
+passes each candidate with `printf '%s'`. This means:
 
-- **No `/dev/mapper/<name>` device is created.** There is nothing to
-  forget to close, nothing that could get mounted accidentally, no
-  mapping left dangling if a script crashes mid-run.
-- **Nothing is written to the volume.** The operation is purely a read
-  of the header/keyslot region plus in-memory cryptographic computation
-  on the candidate passphrase. It does not touch the data segment at
-  all.
-- **It can be run any number of times, safely**, including in a tight
-  loop across hundreds of candidates — which is exactly what this
-  tool does. There is no lockout, rate-limiting, or wear concern at the
-  `cryptsetup` level (though see the Argon2id cost note above — the
-  *practical* limit is your own patience and CPU/RAM, not any risk of
-  harm from repeated attempts).
+- **No device mapping is created**, so there is nothing to close or
+  accidentally mount.
+- **The data is never read or written**; only the header and keyslot
+  area are read.
+- **The header can be rewritten, in one case.** If one of the two
+  header copies is damaged, any cryptsetup command that reads the
+  header, including `--test-passphrase`, rewrites the damaged copy
+  from the good one (shown by
+  [`experiments/corruption-signals/`](../experiments/corruption-signals)).
+  With an intact header, the experiment found the image unchanged
+  after every search. Working on an image of the device, rather than
+  the device itself, avoids even that.
+- **It can be repeated freely.** cryptsetup has no lockout or rate
+  limit; the only limit is the time each guess takes.
 
-The exit code tells you the result: `0` means the passphrase unwrapped
-a keyslot successfully; non-zero means it didn't. `recover-passphrase`
-just automates checking that exit code across a generated candidate
-list and reports the first (and, information-theoretically, only
-plausible) match.
+The exit status says what happened: `0` means a keyslot accepted the
+passphrase, and `2` means "no permission (bad passphrase)"; other
+values are errors such as "wrong device specified" (`cryptsetup(8)`,
+"RETURN CODES"). The script treats only `2` as a non-matching
+candidate. Any other error stops the search and prints cryptsetup's
+message, since it would make every remaining candidate fail the same
+way. Before starting, the script also checks that the target is a LUKS
+device at all, and it tests the guess itself first: if the guess
+already works, it says so, since the problem is then not the
+passphrase.
 
-## The three edit operations
+## The three edits
 
-Given a base guess, the script generates every candidate reachable by
-exactly one of these edits, applied at every applicable position in the
-string:
+From the base guess, the script generates every candidate reachable by
+one of these edits at any position, removes duplicates, and tests them
+in that order:
 
-1. **Substitution**, using a physical-keyboard-adjacency map plus a
-   shift/symbol-confusion table. Covers the case where you meant one
-   key but your finger landed on (or you now recall) an adjacent one —
-   e.g. `s` for `a` (their neighbors on a QWERTY row), or `@` for `2`
-   (the shifted vs. unshifted character sharing a physical key). This
-   is the most common real-world typo pattern for passphrases typed on
-   a physical keyboard. The adjacency map depends on which physical
-   layout the passphrase was actually typed on — select it with
-   `--layout {qwerty,azerty,qwertz}` (default `qwerty`); see
-   [Keyboard layouts](#keyboard-layouts) below.
-2. **Deletion**, removing exactly one character at each position. Covers
-   the case where a keystroke didn't register when the passphrase was
-   originally set (a common failure mode with worn keyboards, fast
-   typing, or certain USB keyboard/hub combinations dropping the
-   occasional keypress) — you've been confidently typing the passphrase
-   *as you remember setting it*, but what actually got stored is one
-   character shorter.
-3. **Insertion**, adding one likely character (digits 0-9 and a small
-   set of common passphrase symbols) at each position. Covers the
-   reverse case — an extra character crept in, e.g. a doubled keystroke,
-   or you're now adding a character that was never actually part of the
-   original passphrase.
+1. **Substitution**: one character replaced by one of its neighbours
+   on the keyboard, or by the character sharing its key with Shift
+   (for example `s` for `a`, or `@` for `2`). The neighbours come from
+   a table for the chosen layout (see
+   [Keyboard layouts](#keyboard-layouts)). The tables cover lowercase
+   letters and digits, and the Shift table covers digits and common
+   symbols; **an uppercase letter gets no substitution candidates**,
+   and nothing tries changing a letter's case.
+2. **Deletion**: one character removed. This finds a passphrase that
+   is one character shorter than what you type, for instance because a
+   keystroke did not register when the passphrase was set.
+3. **Insertion**: one character added at any position, but only from
+   the set `0123456789!@#$%^&*_-.` (change it with `--insert-chars`).
+   **A letter missing from your guess is not found** unless you add
+   letters to that set.
 
-These three operations are the standard definition of "edit distance 1"
-(specifically, Damerau-Levenshtein distance 1 without transposition —
-this tool does not currently generate adjacent-character-swap
-candidates; see the [Roadmap](../README.md#roadmap)). They're chosen
-because, empirically, the overwhelming majority of "I'm sure of this
-passphrase but it's not working" situations trace back to exactly one
-of these three slip types — not to systematically misremembering the
-whole passphrase, which this tool does not attempt to address.
+These are the operations of Levenshtein distance 1 (substitution,
+deletion and insertion), but the script tries only some of the
+possible substitutions and insertions, so it searches a subset of the
+passphrases within distance 1. It does not try swapping two adjacent
+characters (transposition); see the [Roadmap](../README.md#roadmap).
+
+In the experiment, with the passphrase `Tango-ok7`, the script
+recovered it from `Tango-okk7` (deletion), `Tango-ol7` (`l` for its
+neighbour `k`) and `Tango-ok` (inserting `7`), but not from `Tango-o7`
+(a missing letter) or `Rango-ok7` (an uppercase slip).
 
 ## Usage walkthrough
 
 ```
-sudo ./scripts/recover-passphrase /dev/sdX 'my-best-guess-passphrase'
+sudo ./scripts/recover-passphrase /dev/sdX 'my-best-guess'
 ```
 
-Example output:
+Root is needed for a block device. An image file of the device that
+you own needs no root:
 
 ```
-luks-doctor: testing keyslot(s) on /dev/sdX
-luks-doctor: base guess: my-best-guess-passphrase
-luks-doctor: generated 187 candidates (substitution + deletion + insertion)
-luks-doctor: [1/187] testing candidate (substitution, pos 3)... no match
-luks-doctor: [2/187] testing candidate (substitution, pos 3)... no match
+./scripts/recover-passphrase ./device.img 'my-best-guess'
+```
+
+Real output for an image whose passphrase is `Tango-ok7`, with the
+guess `Tango-okk7` (lines 8 to 53, all "no match", are left out):
+
+```
+luks-doctor: testing keyslot(s) on ./device.img
+luks-doctor: base guess: Tango-okk7
+luks-doctor: generated 280 candidates (substitution + deletion + insertion)
+luks-doctor: testing the base guess itself... no match
+luks-doctor: [1/280] testing candidate (substitution, pos 1)... no match
+luks-doctor: [2/280] testing candidate (substitution, pos 1)... no match
+luks-doctor: [3/280] testing candidate (substitution, pos 1)... no match
 ...
-luks-doctor: [61/187] testing candidate (deletion, pos 8)... MATCH
+luks-doctor: [50/280] testing candidate (deletion, pos 7)... MATCH
 
 luks-doctor: recovered passphrase:
-  my-best-guess-passphrase   (original guess, for reference)
-  my-best-uess-passphrase    (working passphrase - note: dropped 'g' at position 8)
+  Tango-okk7   (original guess, for reference)
+  Tango-ok7    (working passphrase - deletion, pos 7)
 
 luks-doctor: SECURITY REMINDER
   This passphrase is now confirmed and was found via automated search.
   You should:
     1. Unlock the volume normally and mount it to confirm data access.
     2. Add a new keyslot with a passphrase you're confident you can type
-       reliably: cryptsetup luksAddKey /dev/sdX
+       reliably: cryptsetup luksAddKey ./device.img
     3. Once confirmed working, consider removing the old/typo-prone
-       keyslot: cryptsetup luksKillSlot /dev/sdX <slot>
+       keyslot: cryptsetup luksKillSlot ./device.img <slot>
   Treat any passphrase that was ever tested in bulk, or written to a
   terminal/log, as lower-confidence going forward - rotate it if this
   volume protects anything sensitive.
 ```
 
-Run `./scripts/recover-passphrase --help` for the full option list,
-including limiting which edit operations run and adjusting the
-insertion character set.
+Positions count from 0. The search started at position 1 because the
+`T` at position 0 is uppercase. If nothing matches, the script says so
+and exits with status 1.
+
+**The guess is visible to other users while the script runs.** It is
+a command-line argument, and `/proc/pid/cmdline` "holds the complete
+command line for the process" (`proc_pid_cmdline(5)`), which every
+user can read unless `/proc` is mounted with `hidepid` (the default is
+`hidepid=0`, "Everybody may access all /proc/pid directories",
+`proc(5)`). It may also end up in your shell history. Run the script
+on a machine where that matters as little as possible, and change the
+passphrase afterwards, as the script's own reminder says.
+
+`./scripts/recover-passphrase --help` lists the options: `--layout`,
+`--no-substitution`, `--no-deletion`, `--no-insertion` and
+`--insert-chars`.
 
 ## Keyboard layouts
 
-`--layout` selects which physical-key adjacency map substitution
-candidates are generated from:
+`--layout` selects the table of neighbouring keys used for
+substitution:
 
-- **`qwerty`** (default) — US QWERTY. The original, hand-tuned map this
-  tool started with.
-- **`azerty`** — French AZERTY. Row 1 is `a z e r t y u i o p` (not
-  `q w e r t y u i o p`), row 2 gains a trailing `m`, row 3 loses `m` and
-  gains a leading `w`. Digit substitution additionally covers the
-  ASCII-safe subset of AZERTY's unshifted-symbol/shifted-digit number
-  row (`1`↔`&`, `4`↔`'`, `5`↔`(`) — the remaining number-row keys
-  unshift to accented characters (`é`, `"`, `è`, `_`, `ç`, `à`) outside
-  this tool's ASCII-only candidate set and are intentionally skipped.
-- **`qwertz`** — German/Central European QWERTZ. Physically identical
-  to QWERTY except the `Y` and `Z` keys are swapped; every other key,
-  including the whole number row, sits in the same place.
+- **`qwerty`** (default): US QWERTY.
+- **`azerty`**: French AZERTY. The top letter row is `a z e r t y u i
+  o p`, the middle row ends in `m`, and the bottom row starts with `w`.
+  The Shift table also includes the ASCII pairs of AZERTY's number row
+  (`1`/`&`, `4`/`'`, `5`/`(`); the other keys of that row give accented
+  or other non-ASCII characters and are left out.
+- **`qwertz`**: German QWERTZ, the QWERTY table with `y` and `z`
+  swapped.
 
-Pick whichever layout the passphrase was actually typed on when the
-suspected typo happened — that's what determines which key a
-mistyped finger would actually have landed on. If you're unsure or the
-passphrase was typed on a layout not listed here (e.g. Dvorak — not yet
-supported, see the [Roadmap](../README.md#roadmap)), the default
-`qwerty` map is still a reasonable first attempt, since deletion and
-insertion candidates are layout-independent and unaffected either way.
+The tables are written into the script; they were derived from the
+standard layouts by hand, not from a keymap file. Pick the layout the
+passphrase was typed on when the slip happened. If the layout is not
+listed (Dvorak, for example, which is on the
+[Roadmap](../README.md#roadmap)), `qwerty` is still worth trying:
+deletion and insertion do not depend on the layout.
+
+Passphrases with non-ASCII characters have not been tested. The
+script counts characters with the shell's `${#var}` and picks them out
+with `cut -c`, and both treat multibyte characters differently
+depending on the shell, the locale and the version of `cut` (GNU
+coreutils 9.12's `cut -c` handles UTF-8 characters whole; dash's
+`${#var}` counts bytes), so candidates for such passphrases may be
+wrong.
 
 ---
 
-For what's deliberately *not* built yet — larger edit distances,
-a Dvorak layout map, dictionary-based candidates, GPU-accelerated
-search — see the [Roadmap section of the README](../README.md#roadmap).
+For what is deliberately not built yet (larger edit distances,
+transposition, a Dvorak table, dictionary-based candidates, GPU
+search), see the [Roadmap section of the README](../README.md#roadmap).
