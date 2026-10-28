@@ -1,9 +1,15 @@
 # LUKS2 Header and Keyslot Anatomy
 
-This document explains how a LUKS2-encrypted volume is structured on disk,
-what each part is for, and how to read that structure directly using
-`cryptsetup luksDump` and raw tools like `dd`/`xxd`. It assumes no prior
-knowledge of LUKS internals.
+This document explains how a LUKS2-encrypted volume is laid out on
+disk, what each part is for, and how to read it with
+`cryptsetup luksDump` and raw tools like `dd` and `xxd`. It assumes no
+prior knowledge of LUKS internals. Layout claims are checked against a
+real header by [`experiments/header-anatomy/`](../experiments/header-anatomy).
+
+Sources used throughout: the LUKS2 On-Disk Format Specification
+v1.1.4 ([PDF at commit `a81aa2fe`](https://gitlab.com/cryptsetup/LUKS2-docs/-/blob/a81aa2fef8d176debdbec297c1e0b74bb50cfee8/luks2_doc_wip.pdf),
+cited as "spec"), and cryptsetup at commit
+[`bae21790`](https://gitlab.com/cryptsetup/cryptsetup/-/tree/bae21790d59897ac50e5471f953f76b3a58aeeb6).
 
 ## Contents
 
@@ -20,95 +26,85 @@ knowledge of LUKS internals.
 ## What LUKS2 is, and why header/keyslot separation exists
 
 LUKS (Linux Unified Key Setup) is the standard on-disk format for
-block-device encryption on Linux. LUKS2 is the current major version,
-superseding LUKS1. `cryptsetup` is the userspace tool that creates,
-inspects, and manages LUKS volumes on top of the kernel's `dm-crypt`.
+block-device encryption on Linux. LUKS2 is the current version,
+succeeding LUKS1. `cryptsetup` is the userspace tool that creates,
+inspects and manages LUKS volumes on top of the kernel's `dm-crypt`.
 
-The central design idea in LUKS — the reason it isn't "just" a password
-that derives an encryption key directly — is the separation between:
+The central design idea in LUKS is the separation between:
 
-- **The master key**: a large random value that is the *actual* key used
-  to encrypt and decrypt every block of data on the volume. It is
-  generated once, at volume creation, and never derived from a
-  passphrase.
-- **Keyslots**: independent, separately-encrypted copies of that same
-  master key, each protected by a different passphrase (or other
-  credential, such as a FIDO2 token or TPM-sealed secret via `systemd-cryptenroll`).
+- **The master key**: a random key, 32 or 64 bytes with cryptsetup's
+  defaults, that encrypts and decrypts the volume's data. `luksFormat`
+  generates it once; it is never derived from a passphrase. See
+  [`master-key-lifecycle.md`](master-key-lifecycle.md).
+- **Keyslots**: separate copies of that same master key, each
+  encrypted under a key derived from a different passphrase. A
+  passphrase can also be produced by another unlock mechanism, such as
+  a FIDO2 key, a PKCS#11 token or a TPM2 chip enrolled with
+  [`systemd-cryptenroll`](https://www.freedesktop.org/software/systemd/man/latest/systemd-cryptenroll.html).
 
-This indirection is what makes several everyday operations possible:
+This indirection makes several everyday operations cheap:
 
-- **Multiple passphrases** can unlock the same volume, each in its own
-  keyslot, without needing to re-encrypt the entire disk.
-- **Changing a passphrase** just re-wraps the master key in a keyslot
-  under a new passphrase — the (potentially huge) bulk data on disk is
-  never touched or re-encrypted.
-- **Revoking a passphrase** (e.g. a lost laptop, an offboarded employee)
-  is a matter of wiping one keyslot, not re-encrypting the volume.
+- **Multiple passphrases** can unlock the same volume, each through its
+  own keyslot, without re-encrypting the data.
+- **Changing a passphrase** re-encrypts one keyslot's copy of the
+  master key under the new passphrase; the data is not touched.
+- **Removing a passphrase** deletes one keyslot. cryptsetup overwrites
+  the keyslot's area when it does so (with the 39-pass Gutmann pattern
+  on rotational disks and one pass of random data on other devices:
+  `LUKS2_keyslot_wipe()` in `lib/luks2/luks2_keyslot.c`, lines 704–711,
+  and `lib/utils_wipe.c`, lines 228–231). On SSDs and other flash
+  storage the old copy can survive anyway; see
+  [`af-splitting-explained.md`](af-splitting-explained.md#the-problem-af-splitting-solves-restated-concretely).
+  Anyone who kept a header backup, or an image of the device, can still
+  use the removed passphrase with that copy.
 
-The **header** is the small, fixed-format region at the start (and,
-redundantly, mirrored elsewhere) of the device that holds everything
-needed to *interpret* the rest of the device: which cipher is in use,
-where the keyslots live, where the encrypted data segment begins, and
-the metadata describing all of that. The header is not secret — an
-attacker with the device already has it — but it is essential: lose or
-corrupt it beyond repair, and every byte of "random-looking" data after
-it is unrecoverable, no matter how correct your passphrase is.
+The **header** is the region at the start of the device that holds
+everything needed to interpret the rest: the cipher, where the
+keyslots are, where the encrypted data starts, and the metadata
+describing all of that. The header is not secret, but it is essential:
+if it is lost or damaged beyond repair, and no backup exists, the data
+cannot be decrypted, whatever passphrase you have.
 
 ## On-disk layout
 
-A LUKS2 device, from byte 0, is divided into three logical areas (per the
-[LUKS2 on-disk format spec](https://gitlab.com/cryptsetup/LUKS2-docs)): the
-binary structured header, the JSON metadata area, and the keyslots area.
-The binary header and JSON area are each stored **twice** (primary +
-secondary); the keyslots area has no redundancy at all.
+A LUKS2 header has three areas (spec §2, p.3): a binary header, a JSON
+metadata area, and a keyslots area. The binary header and JSON area
+are stored twice (primary and secondary); "There is no redundancy in
+the binary keyslots area."
 
-Concretely, for a volume created with defaults (`cryptsetup luksFormat`'s
-12 KiB JSON area, one keyslot) the byte ranges look like this:
+With cryptsetup 2.8.8's defaults, the layout is
+([`experiments/header-anatomy/`](../experiments/header-anatomy)):
 
 ```
-Offset (hex)  Offset (dec)  Size        Region
-------------  ------------  ----------  ------------------------------------
-0x00000000    0             4096 B      Primary binary header
-                                         ("LUKS\xba\xbe" magic, see below)
-0x00001000    4096          12288 B     Primary JSON metadata area
-                                         (hdr_size - 4096 bytes)
-------------  ------------  ----------  ------------------------------------
-0x00004000    16384         4096 B      Secondary binary header
-                                         ("SKUL\xba\xbe" magic, reversed)
-0x00005000    20480         12288 B     Secondary JSON metadata area
-                                         (mirrors primary JSON content)
-------------  ------------  ----------  ------------------------------------
-0x00008000    32768         variable    Keyslot area(s)  [example offset]
-                                         one region per keyslot; exact
-                                         offset/size come from each keyslot's
-                                         JSON "area" object, not a fixed
-                                         layout (see below)
-------------  ------------  ----------  ------------------------------------
-...           ...           variable    (optional) LUKS2 token data,
-                                         if any token stores inline data
-------------  ------------  ----------  ------------------------------------
-0x00400000    4194304       variable    Data segment  [example offset]
-              (4 MiB)                   the encrypted payload itself
-                                         (filesystem, LVM PV, ...); starts
-                                         where JSON "segments" says it does
-------------  ------------  ----------  ------------------------------------
+Offset (hex)  Offset (dec)  Size          Region
+------------  ------------  ------------  ----------------------------------
+0x00000000    0             4096 B        Primary binary header
+                                           (magic "LUKS\xba\xbe")
+0x00001000    4096          12288 B       Primary JSON area
+------------  ------------  ------------  ----------------------------------
+0x00004000    16384         4096 B        Secondary binary header
+                                           (magic "SKUL\xba\xbe")
+0x00005000    20480         12288 B       Secondary JSON area
+------------  ------------  ------------  ----------------------------------
+0x00008000    32768         16744448 B    Keyslots area
+                                           (config.keyslots_size); each
+                                           keyslot's area is a range in it
+                                           given by its JSON "area" object
+------------  ------------  ------------  ----------------------------------
+0x01000000    16777216      rest of       Data segment
+              (16 MiB)      device        (segments.0.offset)
+------------  ------------  ------------  ----------------------------------
 ```
 
-The `0x00400000` (4 MiB) start for the data segment above is
-`cryptsetup luksFormat`'s **default total metadata region size** — not a
-fixed constant. The actual boundary is whatever the JSON `segments.0.offset`
-field says (see [The JSON metadata
-area](#the-json-metadata-area)); it can be as small as the primary+secondary
-header/JSON regions require, or explicitly widened at format time
-(`--luks2-metadata-size`, `--luks2-keyslots-size`) to leave room for more or
-larger keyslots.
+These offsets are defaults, not constants. The data segment starts
+wherever `segments.0.offset` says; `luksDump` shows it as the data
+segment's `offset`, and `--luks2-metadata-size` and
+`--luks2-keyslots-size` change the metadata and keyslots area sizes at
+format time.
 
-Likewise, the secondary header's `0x4000` offset above is only the default
-that follows from a 12 KiB JSON area — it is fixed *relative to the
-configured JSON area size*, since the secondary header must start
-immediately after the primary header's JSON area ends. The LUKS2 spec
-defines a fixed table of valid (offset, JSON-size) pairs — a device is never
-free to pick an arbitrary secondary offset:
+The secondary header starts immediately after the primary JSON area,
+so its offset depends on the JSON area size. The specification allows
+only these combinations (spec §2.1, Table 1, p.4):
 
 | Secondary header offset (bytes) | JSON area size |
 |---|---|
@@ -122,192 +118,184 @@ free to pick an arbitrary secondary offset:
 | `0x200000` (2097152) | 2044 KiB |
 | `0x400000` (4194304) | 4092 KiB |
 
-Always read the *actual* secondary offset from the primary header's
-`hdr_size` field (or `luksDump`'s output) rather than assuming `0x4000` —
-see the binary header field table below for where `hdr_size` lives.
+Read the real secondary offset from the primary header's `hdr_size`
+field rather than assuming `0x4000`. If the primary header is
+unreadable, cryptsetup itself tries each of these offsets in turn to
+find the secondary (`LUKS2_disk_hdr_read()`,
+`lib/luks2/luks2_disk_metadata.c`, lines 682–693).
 
 ### The binary header, byte-by-byte
 
-The 4 KiB binary header (`struct luks2_hdr_disk` in `cryptsetup`'s source,
-per the [official LUKS2 on-disk format
-spec](https://gitlab.com/cryptsetup/LUKS2-docs)) is a fixed, packed C
-struct — every field lives at a precise byte offset, all multi-byte
-integers are big-endian, and all strings are NUL-terminated. This is the
-part of the header `blkid` and similar tools scan without touching the
-JSON area at all:
+The binary header is `struct luks2_hdr_disk` (spec §2.1, Figure 2,
+p.5): a packed C struct of exactly 4096 bytes in which "All integer
+values are stored in the big-endian format" and all strings are
+NUL-terminated. It is "intended for a quick scanning by blkid" (spec
+§2.1, p.4).
 
 ```
 Offset (hex/dec)   Field         Size (B)  Purpose
 -----------------  ------------  --------  ----------------------------------
 0x0000    (0)      magic                6  "LUKS\xba\xbe" (primary) or
-                                            "SKUL\xba\xbe" (secondary,
-                                            byte-reversed)
-0x0006    (6)      version              2  Always 2 for LUKS2
-0x0008    (8)      hdr_size             8  Total header size incl. JSON area
-                                            (bytes) — secondary offset/size
-                                            must match this
-0x0010    (16)     seqid                8  Sequence number, bumped on every
-                                            update; higher seqid wins on a
-                                            primary/secondary disagreement
-0x0018    (24)     label               48  Optional ASCII label, or empty
-0x0048    (72)     csum_alg            32  Checksum algorithm name, e.g.
-                                            "sha256"
-0x0068    (104)    salt                64  Per-header random salt (anti-
-                                            dedup; unused after header read)
-0x00a8    (168)    uuid                40  Device UUID (LUKS1-compatible
-                                            format)
+                                            "SKUL\xba\xbe" (secondary)
+0x0006    (6)      version              2  2 for LUKS2
+0x0008    (8)      hdr_size             8  Header size including the JSON
+                                            area, in bytes
+0x0010    (16)     seqid                8  Increased on every header update
+0x0018    (24)     label               48  Optional label, or empty
+0x0048    (72)     csum_alg            32  Checksum algorithm, e.g. "sha256"
+0x0068    (104)    salt                64  Random, different in every header
+0x00a8    (168)    uuid                40  Device UUID, same format as LUKS1
 0x00d0    (208)    subsystem           48  Optional secondary label
 0x0100    (256)    hdr_offset           8  This header's own offset on the
-                                            device (bytes) — must match
-                                            reality, or the header is
-                                            rejected
-0x0108    (264)    padding            184  Reserved, must be zeroed
-0x01c0    (448)    csum                64  Checksum over the whole binary
-                                            header + JSON area (csum field
-                                            itself zeroed during computation)
-0x0200    (512)    padding4096       3584  Reserved, must be zeroed (pads
-                                            the struct out to one full
-                                            4096-byte sector for atomic
-                                            writes)
+                                            device, in bytes
+0x0108    (264)    _padding           184  Must be zero
+0x01c0    (448)    csum                64  Checksum of binary header + JSON
+                                            area, computed with csum zeroed
+0x0200    (512)    _padding4096      3584  Must be zero
 -----------------  ------------  --------  ----------------------------------
                    TOTAL             4096
 ```
 
-Three fields carry the most operational weight for diagnosis:
+Only the first 512 bytes are used; the struct is 4096 bytes so that
+"the binary header is always written to only one sector (atomic
+write)" (spec §2, p.3). The fields that matter most for diagnosis:
 
-- **`hdr_size`** — tells you exactly where the JSON area ends and,
-  therefore, where the secondary header must begin. If a tool's assumed
-  `0x4000` offset doesn't match, check this field first before suspecting
-  corruption.
-- **`hdr_offset`** — a self-check: the header records *its own* expected
-  position. A mismatch here (e.g. because a partition was resized or the
-  device start shifted) means the header must not be trusted, even if its
-  checksum is otherwise internally consistent — this is a deliberate
-  guard against partition-table manipulation, not a corruption case
-  `cryptsetup repair` can silently paper over.
-- **`csum`** — how, precisely, per code: `cryptsetup` reads the 4096-byte
-  binary header plus the whole JSON area, zeroes out the 64-byte `csum`
-  field in its own in-memory copy (`csum` obviously can't include itself
-  in the hash it stores), hashes the rest with `csum_alg` (SHA-256 by
-  default), and compares the result against the `csum` value actually
-  read from disk with `memcmp` — confirmed directly in
-  `hdr_checksum_calculate()`/`hdr_checksum_check()`
-  ([`lib/luks2/luks2_disk_metadata.c`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/main/lib/luks2/luks2_disk_metadata.c),
-  verified 2026-08-17). This is a plain integrity checksum, not a
-  KDF-based verification like the master-key `digests` check (see
-  [`af-splitting-explained.md`](af-splitting-explained.md#how-a-wrong-key-is-detected)) —
-  it only proves the header + JSON bytes weren't altered or corrupted in
-  transit/at rest, nothing about any passphrase. A checksum mismatch
-  doesn't cause a hard failure by itself: `LUKS2_disk_hdr_read()` reads
-  primary and secondary headers independently, marks either one that
-  fails its own checksum as unusable, and falls back to whichever copy
-  (if any) passed — `seqid` (the field above `label`) only comes into
-  play as a tiebreaker when *both* copies pass their checksum but
-  disagree, picking the higher (more recent) sequence number. This is
-  exactly the fallback `cryptsetup repair` exploits to resync a damaged
-  primary header from a good secondary — see
-  [`checking-for-corruption.md`](checking-for-corruption.md#when-to-run-cryptsetup-repair-and-what-it-cant-fix).
+- **`hdr_size`**: where the JSON area ends and, therefore, where the
+  secondary header must start. The JSON area is `hdr_size` − 4096 bytes
+  (spec §2.2, p.5).
+- **`seqid`**: increased on every update. "The header with a higher
+  seqid is more recent and is used for recovery" (spec §2.1, p.4).
+  `luksDump` prints it as `Epoch`.
+- **`hdr_offset`**: the header's own position on the device. Both
+  headers have it (0 for the primary). If it does not match where the
+  header was read from, "the header is misplaced and must not be used.
+  It is a prevention to partition resize or manipulation with the
+  device start offset" (spec §2.1, p.5). cryptsetup rejects such a
+  header (`hdr_disk_sanity_check_pre()`, lines 178–220, the check at
+  line 193).
+- **`csum`**: cryptsetup hashes the 4096-byte binary header with `csum`
+  zeroed, followed by the JSON area, using `csum_alg` (SHA-256 by
+  default), and compares the result with the stored value using
+  `memcmp()` (`hdr_checksum_calculate()` and `hdr_checksum_check()`,
+  [`lib/luks2/luks2_disk_metadata.c`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/bae21790d59897ac50e5471f953f76b3a58aeeb6/lib/luks2/luks2_disk_metadata.c),
+  lines 61–83 and 88–114). The checksum detects accidental damage
+  only. The specification says "Metadata checksum and redundancy can
+  prevent random metadata corruption only. It does not cover
+  intentional modification" (spec §1.2, p.3): anyone who can write to
+  the device can change the metadata and recompute the checksum. It is
+  separate from the master-key digest (see
+  [`af-splitting-explained.md`](af-splitting-explained.md#how-a-wrong-key-is-detected)),
+  which checks a candidate key, not the header.
 
-Per the spec, only the first 512 bytes of this 4096-byte struct are
-actually populated — the trailing `padding4096` exists purely so the
-whole header fits in one atomically-writable sector.
+When cryptsetup reads the header (`LUKS2_disk_hdr_read()`, lines
+640–807), it reads and validates each copy separately, and a copy with
+a bad checksum or invalid JSON is not used. If both copies are valid
+but their `seqid` differs, the one with the higher `seqid` wins (lines
+698–703). If only one copy is valid and the command allows recovery,
+cryptsetup rewrites the bad copy from the good one with a new salt
+(lines 722–768); if the device also carries other signatures that make
+it ambiguous, it refuses and asks you to run `cryptsetup repair`. In
+the experiment, a read-only `luksDump` worked with a damaged primary
+header but left it damaged, and `cryptsetup repair` rewrote it from
+the secondary; see
+[`checking-for-corruption.md`](checking-for-corruption.md#when-to-run-cryptsetup-repair-and-what-it-cant-fix).
 
-One more structural point not visible in either diagram above: **keyslot
-areas have no fixed offsets at all** — unlike LUKS1, where keyslot geometry
-was rigidly baked into the format, LUKS2 keyslot location and size are
-*described by* each keyslot's own `area` object in the JSON metadata (see
-[Reading Area offset / Area length](#reading-area-offset--area-length)).
-This indirection is what allows a variable number of keyslots with
-independent KDF parameters, rather than a fixed number of fixed-size slots.
+**Keyslot areas have no fixed offsets.** In LUKS1, the header has a
+fixed array of 8 keyslots (`LUKS_NUMKEYS`; LUKS1 spec v1.2.3, p.12).
+In LUKS2, each keyslot's location and size are given by its own
+`area` object in the JSON metadata (see
+[Reading Area offset / Area length](#reading-area-offset--area-length)),
+and keyslot areas are "allocated on-demand" (spec §2, p.3).
 
 ## The JSON metadata area
 
-Everything after each 4 KiB binary header is a JSON document describing
-the volume. Run:
+After each binary header comes a JSON document describing the volume,
+stored as a NUL-terminated string with the rest of the area zeroed
+(spec §2.2, p.5). To see it in readable form:
 
 ```
 sudo cryptsetup luksDump /dev/sdX
 ```
 
-to see this rendered in human-readable form, or:
+or as raw JSON:
 
 ```
 sudo cryptsetup luksDump --dump-json-metadata /dev/sdX
 ```
 
-to get the raw JSON directly (useful for scripting or archiving a copy
-of your header's metadata for backup purposes).
+(Neither needs root on an image file you own.) The top-level objects
+(spec §3, pp.6–13):
 
-The JSON document has several top-level sections. The ones you'll deal
-with most often:
+- **`config`**: `json_size` and `keyslots_size` (which must match the
+  binary header and be 4096-byte aligned, respectively), and optional
+  `flags` and `requirements` (spec §3.5, p.12).
+- **`keyslots`**: one entry per keyslot, keyed by number (`"0"`,
+  `"1"`, …). Each has:
+  - `type`: `"luks2"` for an ordinary keyslot; `"reencrypt"` is an
+    optional type used during re-encryption (spec §3.2.2, p.9).
+  - `key_size`: the size in bytes of the key stored in the keyslot,
+    the master key.
+  - `af`: the anti-forensic splitter: `type` (`"luks1"`, the only type
+    used), `stripes` (only 4000 is supported) and `hash` (the hash
+    used in the AF diffusion, e.g. `sha256`).
+  - `area`: where the keyslot's encrypted, AF-split copy of the key is
+    stored: `offset` and `size` in bytes, `encryption` (the cipher that
+    encrypts the area) and `key_size` (that cipher's key size).
+    cryptsetup uses the volume's own cipher for the area whenever it
+    can (see
+    [`af-splitting-explained.md`](af-splitting-explained.md#what-is-written-to-disk)).
+  - `kdf`: the function that turns a passphrase into the area key:
+    `type` (`argon2id`, `argon2i` or `pbkdf2`) and its parameters (see
+    [Argon2id](#argon2id)).
+  - `priority` (optional): 0 = ignore unless named, 1 = normal,
+    2 = high.
+- **`digests`**: each digest is "used to verify that a key decrypted
+  from a keyslot is correct" (spec §3.4, p.12), and lists the keyslots
+  and segments it belongs to. This lets cryptsetup tell whether a
+  passphrase was right without touching the data.
+- **`segments`**: the encrypted data area(s): `type`, `offset`, `size`
+  (or `"dynamic"` for the rest of the device), and for `crypt`
+  segments `iv_tweak`, `encryption` (e.g. `aes-xts-plain64`) and
+  `sector_size` (spec §3.3, pp.10–11).
+- **`tokens`** (optional): each token "can describe how to get a
+  passphrase to unlock a particular keyslot" and lists the keyslots it
+  belongs to (spec §3.6, p.13); `systemd-cryptenroll` stores its FIDO2,
+  PKCS#11 and TPM2 enrollments here.
 
-- **`config`**: overall metadata region sizing (`json_size`,
-  `keyslots_size`) and a few volume-wide flags.
-- **`keyslots`**: one entry per keyslot, keyed by keyslot number
-  (`"0"`, `"1"`, ...). Each entry describes:
-  - `type` — usually `"luks2"` for a passphrase-protected keyslot
-    (there are other types, e.g. `"reencrypt"` for in-progress
-    re-encryption bookkeeping).
-  - `key_size` — size in bytes of the key material this slot protects
-    (matches the master key size for the volume's cipher).
-  - `af` — the anti-forensic (AF) splitting parameters: `type` (almost
-    always `"luks1"`, the AF algorithm carried over from LUKS1),
-    `stripes` (default 4000), and `hash` (the hash used in the AF
-    diffusion, e.g. `sha256`).
-  - `area` — where on disk this keyslot's *encrypted, AF-striped* key
-    material actually lives: `offset`, `size` (bytes), `encryption`
-    (the cipher used to encrypt this keyslot's data, independent of the
-    volume's data cipher, though usually matching), and `key_size`.
-  - `kdf` — the key-derivation function used to turn a passphrase into
-    the key that unwraps this slot: `type` (`argon2id`, `argon2i`, or
-    legacy `pbkdf2`), plus the tunable cost parameters (see
-    [Argon2id](#argon2id) below).
-- **`digests`**: one entry per digest, used to verify that a candidate
-  master key (recovered by successfully unwrapping *any* keyslot) is
-  actually correct, without needing to touch the encrypted data segment.
-  Each digest independently binds to a set of keyslots via `keyslots`,
-  so LUKS2 can tell you whether an unwrapped key is right before you
-  ever try to mount anything.
-- **`segments`**: describes the encrypted data area(s) — starting
-  `offset`, `size` (or `"dynamic"` for "rest of device"), `iv_tweak`,
-  `encryption` (the cipher spec, e.g. `aes-xts-plain64`), and
-  `sector_size`.
-- **`tokens`** (optional): metadata for auxiliary unlock mechanisms —
-  e.g. `systemd-cryptenroll`'s TPM2 or FIDO2 tokens, or just a stored
-  hint/label. Tokens reference one or more keyslots they can unlock.
-
-A trimmed example (`luksDump` human-readable form) for one keyslot:
+The keyslot part of `luksDump` for a volume formatted with
+cryptsetup 2.8.8's defaults (from the experiment, salt elided):
 
 ```
 Keyslots:
   0: luks2
-        Key:        512 bits
-        Priority:   normal
-        Cipher:     aes-xts-plain64
-        Cipher key: 512 bits
-        PBKDF:      argon2id
-        Time cost:  5
-        Memory:     1048576
-        Threads:    4
-        Salt:       XX XX XX XX XX XX XX XX ... (32 bytes)
-        AF stripes: 4000
-        AF hash:    sha256
-        Area offset:32768 [bytes]
-        Area length:258048 [bytes]
-        Digest ID:  0
+	Key:        512 bits
+	Priority:   normal
+	Cipher:     aes-xts-plain64
+	Cipher key: 512 bits
+	PBKDF:      argon2id
+	Time cost:  5
+	Memory:     1048576
+	Threads:    4
+	Salt:       <random>
+	            <random>
+	AF stripes: 4000
+	AF hash:    sha256
+	Area offset:32768 [bytes]
+	Area length:258048 [bytes]
+	Digest ID:  0
 ```
 
-Every field here is discoverable and meaningful — nothing is opaque
-binary magic once you know where to look. `checking-for-corruption.md`
-walks through using `Area offset` / `Area length` in practice.
+`Time cost` and `Memory` depend on the machine that formatted the
+volume (see [Argon2id](#argon2id)).
+[`checking-for-corruption.md`](checking-for-corruption.md) shows how
+to use `Area offset` and `Area length`.
 
 ## Reading Area offset / Area length
 
-`Area offset` and `Area length` (or `offset`/`size` in the raw JSON's
-`keyslots.<N>.area` object) tell you the *exact byte range on the
-physical device* where this keyslot's encrypted key material lives.
-These are absolute byte offsets from the start of the device (byte 0),
-not offsets from the start of the metadata region.
+`Area offset` and `Area length` (`offset` and `size` in the keyslot's
+`area` object) give the byte range on the device where the keyslot's
+encrypted key material is stored, counted from byte 0 of the device
+(spec §3.2.3, p.9: "the offset from the device start").
 
 Given:
 
@@ -316,65 +304,62 @@ Area offset: 32768   [bytes]
 Area length: 258048  [bytes]
 ```
 
-the keyslot's raw data occupies bytes `[32768, 32768 + 258048)` =
-`[32768, 290816)` on the device. You can extract exactly that range with
-`dd` — see `docs/checking-for-corruption.md` for the precise command and
-what to look for in the output. `scripts/inspect-keyslot` automates
-this computation so you never have to do the arithmetic by hand.
+the area occupies bytes `[32768, 32768 + 258048)` = `[32768, 290816)`.
+[`checking-for-corruption.md`](checking-for-corruption.md) gives the
+`dd` command to extract it, and `scripts/inspect-keyslot` computes the
+range for you.
 
-Note that `Area length` is deliberately larger than the master key
-itself — this is because of AF-splitting (below), which expands the key
-material by a configurable factor (default 4000 stripes) before it's
-written to disk.
+The area is much larger than the key because of AF-splitting (below):
+a 64-byte key is split into 4000 stripes, 256,000 bytes, rounded up to
+whole 512-byte sectors. The area is larger still: 258,048 bytes
+(63 × 4096) in the experiment. The remaining 2,048 bytes are not
+zeros: when formatting, cryptsetup fills the whole keyslots area with
+random data (`LUKS2_wipe_header_areas()`,
+`lib/luks2/luks2_json_format.c`, lines 325–379), and nothing
+overwrites that tail afterwards.
 
 ## Argon2id
 
-LUKS2's default key-derivation function (KDF) — the function that turns
-a human passphrase into a cryptographic key capable of unwrapping a
-keyslot — is **Argon2id**. This is a deliberate improvement over LUKS1,
-which used PBKDF2.
+LUKS2's default key derivation function (KDF), the function that turns
+a passphrase into the key that decrypts a keyslot, is **Argon2id**
+(`configure.ac`, line 806). LUKS1 uses PBKDF2.
 
-**Why Argon2id and not PBKDF2:** PBKDF2 is a *compute-hard* KDF — its
-cost comes purely from doing many rounds of hashing, which is cheap to
-parallelize on GPUs and near-free on purpose-built ASICs. That makes
-brute-forcing a weak passphrase against a stolen PBKDF2-protected header
-far more tractable for a well-resourced attacker than the same attack
-against a *memory-hard* KDF. Argon2id (the balanced hybrid variant of
-the Argon2 family, resistant to both side-channel and GPU/ASIC-style
-time-memory tradeoff attacks) forces each guess to also consume a
-significant, configurable amount of RAM, which GPUs and ASICs have far
-less of per compute unit than a general-purpose CPU. This closes most of
-the brute-force cost advantage that specialized hardware would otherwise
-have.
+**Why Argon2id and not PBKDF2.** PBKDF2's cost is repeated hashing,
+which needs almost no memory, so an attacker can run very many guesses
+in parallel on GPUs or dedicated hardware. Argon2 also makes each
+guess fill and read a configurable amount of memory, so parallel
+guessing needs that much memory per guess. Argon2id "works as Argon2i
+for the first half of the first pass over the memory and as Argon2d
+for the rest, thus providing both side-channel attack protection and
+brute-force cost savings due to time-memory trade-offs"
+([RFC 9106](https://www.rfc-editor.org/rfc/rfc9106) §1), and RFC 9106
+recommends it as the default variant (§7.4).
+[`kdf-comparison.md`](kdf-comparison.md) compares the two in detail.
 
-**The three tunable cost parameters**, as shown in `luksDump` output:
+**The three cost parameters**, as `luksDump` shows them:
 
-- **Time cost** (iterations): how many passes Argon2id makes over the
-  memory buffer. Higher = slower to compute, for both legitimate unlocks
-  and attackers.
-- **Memory** (KiB): the size of the memory buffer each single guess must
-  allocate and touch. `Memory: 1048576` means 1 GiB per attempt. This is
-  the parameter that most directly hurts parallel brute-force — an
-  attacker trying many guesses at once needs that much RAM *per
-  concurrent guess*, not just once total.
-- **Threads**: how many threads compute a single guess in parallel
-  (affects wall-clock time, not the fundamental memory/time cost per
-  guess).
+- **Time cost**: the number of passes over the memory (RFC 9106
+  §3.1, "Number of passes t").
+- **Memory**: the memory per guess, in kilobytes. `Memory: 1048576` is
+  1 GiB, cryptsetup's default maximum (`configure.ac`, line 809). An
+  attacker needs this much memory for each guess running at the same
+  time.
+- **Threads**: the degree of parallelism, how many lanes compute one
+  guess in parallel (RFC 9106 §3.1); cryptsetup's default maximum is 4
+  (`configure.ac`, line 810).
 
-`cryptsetup luksFormat` picks Time cost and Memory automatically at
-volume-creation time, calibrated so that unlocking the volume on the
-machine it was created on takes roughly a target duration (by default,
-around 2 seconds) — this is why parameters vary between volumes created
-on different hardware. You can override this with `--pbkdf-force-iterations`,
-`--pbkdf-memory`, and `--pbkdf-parallel` at format or `luksChangeKey` time.
+`luksFormat` chooses the time cost and memory by benchmarking the
+machine, aiming for the configured iteration time, 2000 ms by default
+(`configure.ac`, line 808; `--iter-time` changes it). That is why the
+values differ between volumes formatted on different machines.
+`--pbkdf-force-iterations`, `--pbkdf-memory` and `--pbkdf-parallel`
+set them directly, at format time or when adding or changing a key.
 
-**The practical consequence for recovery tooling**: because each
-passphrase guess against a real keyslot costs a deliberately significant
-amount of time and memory (by design — that's the whole point of using
-Argon2id), any recovery approach that relies on `--test-passphrase`
-against the actual header is only tractable for a small number of
-candidates. This directly shapes the scope of the recovery tool in this
-project — see `docs/passphrase-recovery.md`.
+**What this means for recovery.** Every passphrase guess against a
+real keyslot costs that time and memory, so testing candidates with
+`cryptsetup open --test-passphrase` only works for a small number of
+them. This shapes the recovery tool in this project; see
+[`passphrase-recovery.md`](passphrase-recovery.md).
 
 ## AF-splitting (anti-forensic splitting)
 
@@ -382,11 +367,9 @@ Before a keyslot's copy of the master key is encrypted and written to
 its `area` on disk, LUKS2 expands it with **AF-splitting**
 (anti-forensic splitting), the same algorithm LUKS1 uses: "only the
 luks1 type is currently used", and that type is "compatible with
-LUKS1"
-([LUKS2 spec v1.1.4](https://gitlab.com/cryptsetup/LUKS2-docs/-/blob/a81aa2fef8d176debdbec297c1e0b74bb50cfee8/luks2_doc_wip.pdf)
-§3.2, p.9, and §3.2.4, p.10). The key is split first and the result is encrypted
-(§4.2, p.14). Splitting is not encryption; its purpose is to make the
-keyslot erasable.
+LUKS1" (spec §3.2, p.9, and §3.2.4, p.10). The key is split first and
+the result is encrypted (§4.2, p.14). Splitting is not encryption; its
+purpose is to make the keyslot erasable.
 
 AF-splitting expands an *N*-byte key (64 bytes with the default
 `aes-xts-plain64`) into 4000 stripes of *N* bytes each. LUKS2 supports
@@ -411,7 +394,7 @@ field. In cryptsetup's implementation
 
 **Why this exists.** Removing a passphrase means destroying its
 keyslot's encrypted copy of the master key; otherwise anyone who knows
-the old passphrase can still decrypt it (LUKS2 spec §4.4 "Keyslot
+the old passphrase can still decrypt it (spec §4.4 "Keyslot
 Revocation", p.14). An overwrite can miss a sector that disk firmware
 has remapped to a reserved area, and a 32- or 64-byte key fits in one
 such sector whole. AF-splitting makes the stored copy 4000 times
@@ -425,86 +408,63 @@ storage devices" (§3.2.4, p.10). See
 [`af-splitting-explained.md`](af-splitting-explained.md#the-problem-af-splitting-solves-restated-concretely)
 for the full argument and sources.
 
-**Why this matters when inspecting a keyslot for corruption**: because
-AF-striped, encrypted key material is expected to look like uniform
-high-entropy random noise (that's what "encrypted with no exploitable
-structure" looks like), you *cannot* visually distinguish "encrypted
-correctly" from "gibberish" just by looking at a hex dump — but you
-*can* spot structural corruption, because real random noise doesn't
-produce long runs of a single repeated byte, obvious repeating patterns,
-or premature all-zero padding. `docs/checking-for-corruption.md` covers
-exactly what to look for.
-
-For a byte-by-byte walkthrough of the actual split/merge algorithm — a
-hand-traceable toy example plus a demonstration of exactly why a single
-flipped bit anywhere in the stripe data makes the key unrecoverable, not
-just harder to recover — see
-[`af-splitting-explained.md`](af-splitting-explained.md).
+**What this means when inspecting a keyslot.** The area holds
+ciphertext, which looks like uniformly random bytes whether or not it
+decrypts to the right key, so a hex dump cannot show that a keyslot is
+intact. It can show some kinds of damage that ciphertext does not
+produce, such as long runs of one byte value or repeating patterns;
+[`checking-for-corruption.md`](checking-for-corruption.md) covers what
+to look for. [`af-splitting-explained.md`](af-splitting-explained.md#what-damage-does-to-the-key)
+works through exactly how much of the key one damaged byte destroys.
 
 ## Primary vs. secondary header: legitimate differences
 
-LUKS2 stores **two independent copies** of the binary header + JSON
-metadata: the primary at offset 0, and a secondary (backup) copy at a
-fixed offset (`0x4000` = 16384 bytes, by default). This redundancy
-exists so that damage to the very front of the device (a common failure
-mode — partition table corruption, accidental `dd` of a few sectors,
-firmware bugs on some external enclosures) doesn't necessarily destroy
-your ability to unlock the volume; `cryptsetup luksHeaderRestore` and
-`cryptsetup repair` can fall back to the secondary copy.
+LUKS2 stores two copies of the binary header and JSON area: the
+primary at offset 0 and the secondary right after the primary JSON
+area (offset `0x4000` by default). The copies "under normal
+circumstances contain same functional metadata" (spec §2, p.3), so
+damage to one, for example from overwriting the start of the device,
+can be repaired from the other (see the end of
+[The binary header, byte-by-byte](#the-binary-header-byte-by-byte)).
 
-When you compare the two headers directly (e.g. with `dd`+`xxd`, see
-`docs/checking-for-corruption.md`), you will find they are **not**
-byte-identical, and that is by design, not evidence of corruption:
+Compared byte by byte, the two copies are **not** identical, and that
+is expected. In the experiment, the binary headers differed in exactly
+four fields, as the specification requires:
 
-- **Magic bytes are byte-reversed.** The primary header begins with the
-  ASCII magic `LUKS\xba\xbe` (the traditional LUKS signature). The
-  secondary header begins with `SKUL\xba\xbe` — literally "LUKS"
-  spelled backward. This is intentional: it lets tooling (and a human
-  looking at a hex dump) immediately distinguish "this is a primary
-  header" from "this is a backup header" without needing to know its
-  offset in advance, which matters for recovery scenarios where the
-  device may have been imaged or partially reconstructed.
-- **Independent checksums.** Each header carries its own checksum
-  (SHA-256 by default) over its own binary header fields. Because the
-  headers differ (at minimum, in their magic bytes and their own
-  self-description), their checksums necessarily differ too. A checksum
-  mismatch *within* a single header (i.e., the header's own checksum
-  field doesn't match its own computed contents) indicates corruption;
-  the primary and secondary simply having *different* checksum values
-  from each other is expected and normal.
-- **Independent salts.** Each binary header stores its own random salt,
-  used in header integrity verification. Two independently-generated
-  random salts will always differ — this is not a discrepancy to
-  investigate.
-- **A self-referential offset pointer.** The secondary header's binary
-  structure includes a field recording its own offset on the device
-  (so that tools reading a raw image, without external knowledge of
-  where the backup header lives, can confirm they've found a genuine
-  backup header at the offset they expect). The primary header, always
-  living at offset 0 by convention, has no equivalent need for this
-  field.
+- **`magic`**: `LUKS\xba\xbe` in the primary, `SKUL\xba\xbe` in the
+  secondary (spec §2.1, Figure 2, p.5). cryptsetup checks that each
+  copy has the right one (`hdr_disk_sanity_check_pre()`, line 185).
+- **`salt`**: random, and "different for every header (it differs on
+  the primary and secondary header)". It "is not used after the binary
+  header is read, the main intention is to avoid deduplication of the
+  header sector", and it "must be regenerated on every header repair"
+  (spec §2.1, p.4).
+- **`hdr_offset`**: each header records its own offset, so the primary
+  has 0 and the secondary has 16384 by default.
+- **`csum`**: each copy's checksum covers its own binary header and
+  JSON area. Since the binary headers differ, so do the checksums. A
+  checksum that does not match its own copy means damage; two copies
+  with different checksums is normal.
 
-The JSON metadata *content* between primary and secondary (keyslots,
-digests, segments, tokens) is expected to be **semantically identical**
-even though the surrounding binary header differs — both describe the
-same volume. If the JSON content itself differs meaningfully between
-primary and secondary (e.g. a different number of keyslots, different
-segment offsets), that is a genuine red flag, unlike the expected binary
-header differences above.
+Everything else, including `seqid`, `uuid`, `label` and the JSON
+content, should be the same. A real difference in the JSON content
+(different keyslots or segments, for example) or in `seqid` means the
+copies are out of step, which cryptsetup resolves in favour of the
+valid copy with the higher `seqid`.
 
 ## Command reference
 
 | Command | Purpose |
 |---|---|
-| `cryptsetup luksDump /dev/sdX` | Human-readable dump of header + JSON metadata: cipher, keyslots, KDF parameters, digests, tokens, segments. |
-| `cryptsetup luksDump --dump-json-metadata /dev/sdX` | Raw JSON metadata only, suitable for scripting or archiving. |
-| `dd if=/dev/sdX bs=1 skip=<offset> count=<length> \| xxd` | Extract and hex-dump an arbitrary byte range — used to inspect keyslot areas or compare headers directly. See `docs/checking-for-corruption.md`. |
-| `cryptsetup repair /dev/sdX` | Attempts to fix *structural* JSON metadata damage (e.g. a corrupted or unparseable JSON area, recoverable from the redundant copy or internal consistency checks). Cannot repair corrupted keyslot key material, and cannot help with a wrong passphrase. |
-| `cryptsetup luksHeaderBackup /dev/sdX --header-backup-file <file>` | Back up the entire header region (primary + secondary + keyslot areas) to a file — do this *before* any exploratory work on a real device. |
-| `cryptsetup luksHeaderRestore /dev/sdX --header-backup-file <file>` | Restore a previously backed-up header region. Destructive to the current header — only use on a deliberately restored/known-good backup. |
+| `cryptsetup luksDump /dev/sdX` | Readable dump of the header and JSON metadata: cipher, keyslots, KDF parameters, digests, tokens, segments. |
+| `cryptsetup luksDump --dump-json-metadata /dev/sdX` | The raw JSON metadata only, for scripts or archiving. |
+| `dd if=/dev/sdX bs=1 skip=<offset> count=<length> \| xxd` | Extract and hex-dump a byte range, such as a keyslot area or a header. See [`checking-for-corruption.md`](checking-for-corruption.md). |
+| `cryptsetup repair /dev/sdX` | "Tries to repair the device metadata if possible", for "some known benign LUKS metadata header corruptions"; it "will only change the LUKS header, not any keyslot data", and can warn about some damaged keyslots ([man page](https://gitlab.com/cryptsetup/cryptsetup/-/blob/bae21790d59897ac50e5471f953f76b3a58aeeb6/man/cryptsetup-repair.8.adoc)). It cannot repair a damaged keyslot or help with a wrong passphrase. |
+| `cryptsetup luksHeaderBackup /dev/sdX --header-backup-file <file>` | "Stores a binary backup of the LUKS header and keyslot area" ([man page](https://gitlab.com/cryptsetup/cryptsetup/-/blob/bae21790d59897ac50e5471f953f76b3a58aeeb6/man/cryptsetup-luksHeaderBackup.8.adoc)). Take one before any exploratory work on a real device. With it, any passphrase valid when it was taken can still open the volume. |
+| `cryptsetup luksHeaderRestore /dev/sdX --header-backup-file <file>` | Writes a header backup back to the device. "All keyslots will be replaced; only the passphrases from the backup will work afterward" ([man page](https://gitlab.com/cryptsetup/cryptsetup/-/blob/bae21790d59897ac50e5471f953f76b3a58aeeb6/man/cryptsetup-luksHeaderRestore.8.adoc)). Only use a backup you know is from this device and good. |
 
 ---
 
-Next: [`docs/checking-for-corruption.md`](checking-for-corruption.md) —
-using this knowledge to distinguish a corrupted header/keyslot from a
-simply-wrong passphrase.
+Next: [`checking-for-corruption.md`](checking-for-corruption.md):
+using this to tell a damaged header or keyslot from a wrong
+passphrase.
