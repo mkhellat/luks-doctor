@@ -104,8 +104,8 @@ lengths are multiples of 4096 bytes, so the same bytes can be read in
 `bs=512 skip=64 count=504` for an area at 32768 of length 258048.
 
 `scripts/inspect-keyslot` computes the range and runs the extraction
-for you; see its `--help`. It currently requires root, even for an
-image file.
+for you; see its `--help`. It needs root for a block device but not
+for an image file you own.
 
 ## What healthy key material looks like
 
