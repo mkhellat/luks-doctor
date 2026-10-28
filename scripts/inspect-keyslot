@@ -2,52 +2,54 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Mohammadreza Khellat <mkhellat@beavernets.com>
 #
-# inspect-keyslot - extract and hex-dump a LUKS2 keyslot's raw key
-# material area directly from a device, with a rough visual corruption
-# heuristic. See docs/checking-for-corruption.md for the methodology
-# and how to interpret the output.
+# inspect-keyslot - extract and hex-dump a LUKS2 keyslot's area (its
+# encrypted, AF-split copy of the master key) directly from a device,
+# with two rough visual damage heuristics. See
+# docs/checking-for-corruption.md for the methodology and how to
+# interpret the output.
 
 set -eu
 
 PROG="$(basename "$0")"
 ZERO_RUN_THRESHOLD=32     # bytes; see usage note below on why this is a rough heuristic
-PATTERN_REPEAT_THRESHOLD=6  # consecutive repeats of a period (1-8 bytes) to flag
+PATTERN_REPEAT_THRESHOLD=6  # run of bytes each equal to the one 1-8 bytes earlier
 HEAD_TAIL_BYTES=128
 
 usage() {
     cat <<EOF
 Usage: $PROG [--slot N] [--zero-threshold N] [--pattern-threshold N] /dev/sdX
 
-Inspect a LUKS2 keyslot's raw on-disk key material.
+Inspect a LUKS2 keyslot's area on disk: the keyslot's encrypted,
+AF-split copy of the master key.
 
-Dumps the head and tail of the keyslot's AF-striped area (via dd+xxd)
-and runs two rough heuristic checks: long zero-byte runs (truncated or
-zero-filled writes) and short repeating multi-byte patterns, 1-8 bytes
-wide (fill-pattern or cyclic-buffer artifacts, e.g. a "deadbeef deadbeef
-..." style overwrite). Neither is a rigorous entropy test - both are
-quick visual aids. See docs/checking-for-corruption.md for what healthy
-vs. corrupted output actually looks like and how to interpret it.
+Dumps the head and tail of the area (via dd+xxd) and runs two rough
+heuristic checks over all of it: long runs of zero bytes (zero-filled
+regions) and short repeating patterns, 1-8 bytes wide (fill patterns,
+e.g. a "deadbeef deadbeef ..." overwrite). Neither is a statistical
+test - both are quick visual aids. See docs/checking-for-corruption.md
+for what healthy and damaged areas look like and how to interpret the
+output. cryptsetup repair also checks keyslot areas for low-entropy
+damage and prints a warning when it finds some.
 
-IMPORTANT LIMITATION: neither heuristic, nor any visual/statistical
-inspection method, can detect a single flipped bit (or any small number
-of flipped bits) scattered through otherwise-correct key material. Per
-AF-splitting's diffusion step (SHA-256 by default - see
-docs/af-splitting-explained.md), a single bit flip anywhere in the
-stripe data still looks like uniform random noise; it does not produce
-a zero-run, a repeating pattern, or any other visible artifact. LUKS2
-keyslot areas carry no checksum or ECC layer of their own to catch this
-- these heuristics can only catch damage that leaves a structural
-signature (truncation, fill patterns), not damage that leaves none.
+IMPORTANT LIMITATION: the area holds ciphertext, which looks like
+random bytes. Damage that leaves random-looking bytes - flipped bits,
+or a block overwritten with random data - looks exactly like intact
+ciphertext, so neither these heuristics nor any other inspection of
+the bytes can detect it, and LUKS2 keeps no checksum of keyslot areas.
+Such damage still destroys the key (see
+docs/af-splitting-explained.md); only damage that leaves non-random
+bytes, such as zero fills or repeating patterns, can be seen.
 
 Options:
   --slot N                Inspect keyslot N directly, skipping the prompt.
   --zero-threshold N       Flag zero-byte runs of at least N bytes as
                            suspicious (default: $ZERO_RUN_THRESHOLD).
-  --pattern-threshold N    Flag a repeating pattern (period 1-8 bytes)
-                           that recurs at least N times consecutively
-                           (default: $PATTERN_REPEAT_THRESHOLD; on true
-                           random data, expect ~0 at this threshold
-                           across a keyslot-sized region).
+  --pattern-threshold N    Flag a run of at least N consecutive bytes
+                           that each equal the byte 1-8 positions
+                           earlier, i.e. a repeating pattern of that
+                           period (default: $PATTERN_REPEAT_THRESHOLD;
+                           random data almost never reaches it in a
+                           keyslot-sized area).
   -h, --help               Show this help and exit.
 
 Needs read access to the device: root for a block device, none for
@@ -175,14 +177,15 @@ echo
 # `od` dump piped to awk) rather than re-reading the device twice.
 #
 # Rough heuristics only:
-#  - longest run of the zero byte (truncated/zero-filled write)
-#  - longest run of a short (1-8 byte) repeating pattern (fill-pattern
-#    or cyclic-buffer overwrite, e.g. "deadbeef deadbeef ...")
-# Real high-entropy ciphertext can produce short coincidental runs of
-# either kind by chance; these are visual aids to catch gross
-# truncation/wipe/fill damage, not a statistical corruption proof, and
-# critically do NOT catch single-bit-flip corruption (see the
-# IMPORTANT LIMITATION note in --help). See docs/checking-for-corruption.md.
+#  - longest run of the zero byte (zero-filled region)
+#  - longest run of consecutive bytes each equal to the byte 1-8
+#    positions earlier, i.e. a short repeating pattern (fill-pattern
+#    overwrite, e.g. "deadbeef deadbeef ...")
+# Real ciphertext produces short coincidental runs of either kind by
+# chance; these are visual aids to catch gross zero-fill or pattern
+# damage, not a statistical test, and they do NOT catch damage that
+# leaves random-looking bytes (see the IMPORTANT LIMITATION note in
+# --help). See docs/checking-for-corruption.md.
 HEURISTIC_RESULT="$(dd if="$DEVICE" bs=1 skip="$AREA_OFFSET" count="$AREA_LENGTH" 2>/dev/null | \
     od -An -tu1 -v | tr -s ' ' '\n' | awk '
         NF { n++; b[n] = $0 }
@@ -225,17 +228,17 @@ else
     echo "No suspiciously long zero-runs found (threshold: $ZERO_RUN_THRESHOLD bytes)."
 fi
 
-echo "Longest repeating-pattern run: $LONGEST_PATTERN_RUN consecutive repeats (period $LONGEST_PATTERN_PERIOD byte(s))"
+echo "Longest repeating-pattern run: $LONGEST_PATTERN_RUN bytes, each equal to the byte $LONGEST_PATTERN_PERIOD position(s) earlier"
 if [ "$LONGEST_PATTERN_RUN" -ge "$PATTERN_REPEAT_THRESHOLD" ]; then
-    echo "NOTE: this exceeds the pattern-repeat threshold ($PATTERN_REPEAT_THRESHOLD repeats)."
+    echo "NOTE: this exceeds the pattern threshold ($PATTERN_REPEAT_THRESHOLD bytes)."
     echo "      A short pattern repeating this many times in a row is not"
-    echo "      something real random key material produces by chance - see"
+    echo "      something real ciphertext produces by chance - see"
     echo "      docs/checking-for-corruption.md for how to interpret it."
 else
-    echo "No suspiciously long repeating patterns found (threshold: $PATTERN_REPEAT_THRESHOLD repeats)."
+    echo "No suspiciously long repeating patterns found (threshold: $PATTERN_REPEAT_THRESHOLD bytes)."
 fi
 
 echo
-echo "Reminder: these are rough structural heuristics only. They cannot"
-echo "detect single-bit-flip corruption, which produces no visible"
-echo "signature - see docs/af-splitting-explained.md for why."
+echo "Reminder: these are rough heuristics only. They cannot detect damage"
+echo "that leaves random-looking bytes, such as flipped bits - see"
+echo "docs/checking-for-corruption.md, 'What no inspection can detect'."
