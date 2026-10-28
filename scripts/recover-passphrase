@@ -432,16 +432,37 @@ fi
 total="$( [ -s "$CAND_FILE" ] && wc -l <"$CAND_FILE" || echo 0 )"
 [ "$total" -gt 0 ] || die "no candidates generated (all edit operations disabled?)"
 
+cryptsetup isLuks "$DEVICE" 2>/dev/null ||
+    die "$DEVICE is not a LUKS device (or cannot be read)"
+
 echo "luks-doctor: testing keyslot(s) on $DEVICE"
 echo "luks-doctor: base guess: $GUESS"
 echo "luks-doctor: generated $total candidates (substitution + deletion + insertion)"
+
+# Test one candidate. Returns 0 if it unlocks a keyslot and 1 if
+# cryptsetup reports a wrong passphrase (exit status 2, "no permission
+# (bad passphrase)" in cryptsetup(8) RETURN CODES). Any other failure
+# would make every remaining candidate fail too and look like "no
+# match", so stop and show cryptsetup's message instead.
+test_passphrase() {
+    set +e
+    _err="$(printf '%s' "$1" | cryptsetup open --test-passphrase "$DEVICE" 2>&1 >/dev/null)"
+    _status=$?
+    set -e
+    case "$_status" in
+        0) return 0 ;;
+        2) return 1 ;;
+        *) echo
+           die "cryptsetup failed with exit status $_status: $_err" ;;
+    esac
+}
 
 found=0
 n=0
 while IFS="$(printf '\t')" read -r candidate label; do
     n=$((n + 1))
     printf 'luks-doctor: [%d/%d] testing candidate (%s)... ' "$n" "$total" "$label"
-    if printf '%s' "$candidate" | cryptsetup open --test-passphrase "$DEVICE" 2>/dev/null; then
+    if test_passphrase "$candidate"; then
         echo "MATCH"
         echo
         echo "luks-doctor: recovered passphrase:"
