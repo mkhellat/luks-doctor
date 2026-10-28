@@ -50,11 +50,13 @@ Options:
                            across a keyslot-sized region).
   -h, --help               Show this help and exit.
 
-Requires root (or equivalent raw device read access).
+Needs read access to the device: root for a block device, none for
+an image file of the device that you own.
 
 Example:
   sudo $PROG /dev/sdX
   sudo $PROG --slot 0 /dev/sdX
+  $PROG --slot 0 ./device.img
 EOF
 }
 
@@ -104,12 +106,11 @@ done
 command -v cryptsetup >/dev/null 2>&1 || die "cryptsetup not found in PATH"
 command -v xxd >/dev/null 2>&1 || die "xxd not found in PATH"
 
-# luksDump on a raw device needs read access to the header region even
-# before we get to the keyslot area itself, so fail fast with a clear
-# message rather than letting cryptsetup's permission error stand alone.
-if [ "$(id -u)" -ne 0 ]; then
-    die "must be run as root (raw device read access is required)"
-fi
+# luksDump and dd both need to read the device, so fail fast with a
+# clear message rather than letting cryptsetup's permission error stand
+# alone.
+[ -r "$DEVICE" ] ||
+    die "cannot read $DEVICE (a block device usually needs root)"
 
 DUMP="$(cryptsetup luksDump "$DEVICE" 2>&1)" || die "cryptsetup luksDump failed:
 $DUMP"
