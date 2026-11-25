@@ -35,14 +35,18 @@ cryptsetup luksFormat --type luks2 --batch-mode \
 	--key-file "$work/passphrase" "$img"
 echo "Real passphrase: $pass"
 
-# Print the lines that summarize a search, with the temporary path
+# search GUESS LABEL [OPTIONS...]: run the script with OPTIONS and print
+# the lines that summarize the search, with the temporary path
 # masked.
 search() {
+	guess=$1
+	label=$2
+	shift 2
 	echo
-	echo "== Guess '$1' ($2) =="
+	echo "== Guess '$guess' ($label) =="
 	before=$(sha256sum < "$img")
 	set +e
-	sh "$rp" "$img" "$1" > "$work/out" 2>&1
+	sh "$rp" "$@" "$img" "$guess" > "$work/out" 2>&1
 	status=$?
 	set -e
 	sed -e "s|$work|<tmpdir>|g" "$work/out" |
@@ -63,6 +67,8 @@ search 'Tango-ok'    'final digit missing'
 search 'Tango-o7'    'letter missing'
 search 'Rango-ok7'   'uppercase T typed as its neighbour R'
 search 'Tnago-ok7'   'a and n swapped'
+search 'tango-ok7'   'T typed as t'
+search 'Tango-o7'    'letter missing, with --insert-letters' --insert-letters
 
 echo
 echo "== A file that is not a LUKS device =="
