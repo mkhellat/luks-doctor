@@ -372,12 +372,15 @@ shift_pair() {
 # letter; any other character is printed unchanged. The letter's
 # position in one alphabet string is looked up in the other, which
 # keeps this independent of the locale (unlike tr ranges).
+# Letters are matched with explicit lists below, not [a-z]/[A-Z]
+# ranges: POSIX leaves bracket ranges unspecified outside the C
+# locale, and some locales collate upper and lower case together.
 LOWER_ALPHA='abcdefghijklmnopqrstuvwxyz'
 UPPER_ALPHA='ABCDEFGHIJKLMNOPQRSTUVWXYZ'
 
 to_upper() {
     case "$1" in
-        [a-z])
+        [abcdefghijklmnopqrstuvwxyz])
             _head="${LOWER_ALPHA%%"$1"*}"
             char_at "$UPPER_ALPHA" "${#_head}"
             ;;
@@ -387,7 +390,7 @@ to_upper() {
 
 to_lower() {
     case "$1" in
-        [A-Z])
+        [ABCDEFGHIJKLMNOPQRSTUVWXYZ])
             _head="${UPPER_ALPHA%%"$1"*}"
             char_at "$LOWER_ALPHA" "${#_head}"
             ;;
@@ -409,7 +412,7 @@ shifted_neighbours() {
     while [ "$_k" -lt "$_adjlen" ]; do
         _n="$(char_at "$_adj" "$_k")"
         case "$_n" in
-            [0-9])
+            [0123456789])
                 if [ "$LAYOUT" = "azerty" ]; then
                     _out="${_out}${_n}"
                 else
@@ -479,7 +482,7 @@ if [ "$DO_SUBSTITUTION" -eq 1 ]; then
     while [ "$i" -lt "$len" ]; do
         ch="$(char_at "$GUESS" "$i")"
         case "$ch" in
-            [A-Z]) repl="$(shifted_neighbours "$ch")$(shift_pair "$ch")" ;;
+            [ABCDEFGHIJKLMNOPQRSTUVWXYZ]) repl="$(shifted_neighbours "$ch")$(shift_pair "$ch")" ;;
             *)     repl="$(adjacent_chars "$ch")$(shift_pair "$ch")" ;;
         esac
         replen=${#repl}
@@ -546,8 +549,8 @@ if [ "$DO_CASE_FLIP" -eq 1 ]; then
     while [ "$i" -lt "$len" ]; do
         ch="$(char_at "$GUESS" "$i")"
         case "$ch" in
-            [a-z]) flipped="$(to_upper "$ch")" ;;
-            [A-Z]) flipped="$(to_lower "$ch")" ;;
+            [abcdefghijklmnopqrstuvwxyz]) flipped="$(to_upper "$ch")" ;;
+            [ABCDEFGHIJKLMNOPQRSTUVWXYZ]) flipped="$(to_lower "$ch")" ;;
             *)     flipped="" ;;
         esac
         if [ -n "$flipped" ]; then
