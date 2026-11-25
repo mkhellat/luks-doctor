@@ -3,8 +3,9 @@
 # Copyright (C) 2026 Mohammadreza Khellat <mkhellat@beavernets.com>
 #
 # recover-passphrase - bounded edit-distance-1 search for a nearly-
-# correct LUKS2 passphrase (one substitution, deletion, insertion, or
-# adjacent-character transposition away from a known-good guess). Uses
+# correct LUKS2 passphrase (one substitution, deletion, insertion,
+# adjacent-character transposition, or case slip away from a known-good
+# guess; inserting a letter is opt-in, see --insert-letters). Uses
 # `cryptsetup open --test-passphrase`, which verifies without
 # activating/mapping the device. See
 # docs/passphrase-recovery.md for the methodology and why this is
@@ -18,6 +19,7 @@ DO_SUBSTITUTION=1
 DO_DELETION=1
 DO_INSERTION=1
 DO_TRANSPOSITION=1
+DO_CASE_FLIP=1
 INSERT_CHARS='0123456789!@#$%^&*_-.'
 LAYOUT='qwerty'
 
@@ -29,7 +31,8 @@ Search for a working LUKS2 passphrase within edit distance 1 of a
 known-good guess, using safe non-activating verification
 (cryptsetup open --test-passphrase). Intended for the case where you
 are highly confident of a passphrase but suspect exactly one typo'd,
-dropped, extra, or swapped character. Not a general brute-force tool - see
+dropped, extra, swapped, or wrong-case character (a missing letter is
+only searched with --insert-letters). Not a general brute-force tool - see
 docs/passphrase-recovery.md.
 
 Options:
@@ -41,6 +44,7 @@ Options:
   --no-deletion          Skip single-character deletion candidates.
   --no-insertion         Skip single-character insertion candidates.
   --no-transposition     Skip adjacent-character transposition candidates.
+  --no-case-flip         Skip candidates that flip the case of one letter.
   --insert-chars STR     Character set to try inserting (default: $INSERT_CHARS).
   -h, --help             Show this help and exit.
 
@@ -81,6 +85,10 @@ while [ $# -gt 0 ]; do
             ;;
         --no-transposition)
             DO_TRANSPOSITION=0
+            shift
+            ;;
+        --no-case-flip)
+            DO_CASE_FLIP=0
             shift
             ;;
         --insert-chars)
@@ -516,6 +524,25 @@ if [ "$DO_TRANSPOSITION" -eq 1 ]; then
     done
 fi
 
+# Case flip changes the case of one ASCII letter (a Shift or Caps Lock
+# slip). Other characters have no case and are skipped.
+if [ "$DO_CASE_FLIP" -eq 1 ]; then
+    i=0
+    while [ "$i" -lt "$len" ]; do
+        ch="$(char_at "$GUESS" "$i")"
+        case "$ch" in
+            [a-z]) flipped="$(to_upper "$ch")" ;;
+            [A-Z]) flipped="$(to_lower "$ch")" ;;
+            *)     flipped="" ;;
+        esac
+        if [ -n "$flipped" ]; then
+            candidate="$(substr_range "$GUESS" 0 "$i")${flipped}$(substr_from "$GUESS" $((i + 1)))"
+            add_candidate "$candidate" "case flip, pos $i"
+        fi
+        i=$((i + 1))
+    done
+fi
+
 # Different edits can produce the same string (deleting either 'l' of
 # "ll", for example). Each test costs a full KDF run, so keep only the
 # first occurrence of each candidate.
@@ -530,7 +557,7 @@ cryptsetup isLuks "$DEVICE" 2>/dev/null ||
 
 echo "luks-doctor: testing keyslot(s) on $DEVICE"
 echo "luks-doctor: base guess: $GUESS"
-echo "luks-doctor: generated $total candidates (substitution + deletion + insertion + transposition)"
+echo "luks-doctor: generated $total candidates (substitution + deletion + insertion + transposition + case flip)"
 
 # Test one candidate. Returns 0 if it unlocks a keyslot and 1 if
 # cryptsetup reports a wrong passphrase (exit status 2, "no permission
