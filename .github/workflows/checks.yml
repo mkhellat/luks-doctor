@@ -1,0 +1,64 @@
+# Checks run on every pull request and on pushes to main:
+#   - shellcheck (POSIX sh) over scripts/ and the experiment runners
+#   - every experiment runner, under the runner's /bin/sh (dash)
+#   - SPDX/copyright headers on code files
+# See experiments/README.md for what each experiment verifies.
+name: checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+      - name: shellcheck --shell=sh
+        run: shellcheck --shell=sh scripts/* experiments/*/run
+
+  experiments:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cryptsetup-bin python3-cryptography python3-scipy xxd
+      - name: af-damage-locality
+        run: sh experiments/af-damage-locality/run
+      - name: keyslot-damage-e2e
+        run: sh experiments/keyslot-damage-e2e/run
+      - name: default-key-sizes
+        run: sh experiments/default-key-sizes/run
+      - name: header-anatomy
+        run: sh experiments/header-anatomy/run
+      - name: corruption-signals
+        run: sh experiments/corruption-signals/run
+      - name: entropy-tests
+        run: sh experiments/entropy-tests/run
+      - name: passphrase-recovery
+        run: sh experiments/passphrase-recovery/run
+
+  license-headers:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check SPDX and copyright headers
+        run: |
+          bad=0
+          for f in scripts/* $(find experiments -type f \( -name '*.py' -o -name run \)); do
+            head -n 10 "$f" | grep -qx '# SPDX-License-Identifier: GPL-3.0-or-later' &&
+            head -n 10 "$f" | grep -qx '# Copyright (C) 2026 Mohammadreza Khellat <mkhellat@beavernets.com>' ||
+            { echo "missing header: $f"; bad=1; }
+          done
+          exit "$bad"
