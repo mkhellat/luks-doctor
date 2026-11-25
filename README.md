@@ -192,10 +192,6 @@ following are plausible, not-yet-built extensions — ideas and
 contributions welcome, but none of these are half-implemented anywhere
 in this repo:
 
-- **Dvorak substitution table.** `recover-passphrase --layout` currently
-  covers `qwerty` (default), `azerty`, and `qwertz`. Dvorak arranges
-  the keys differently enough that it would need its own adjacency
-  table built from scratch rather than derived from the QWERTY one.
 - **Dictionary/mnemonic-based candidate generation.** For passphrases
   built from a memorable phrase or word list, generating candidates
   from likely word substitutions or common transformations (leetspeak,
