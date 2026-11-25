@@ -158,8 +158,9 @@ AREA_OFFSET="$(printf '%s\n' "$SLOT_BLOCK" | \
 AREA_LENGTH="$(printf '%s\n' "$SLOT_BLOCK" | \
     sed -n 's/.*Area length:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)"
 
-[ -n "$AREA_OFFSET" ] && [ -n "$AREA_LENGTH" ] || \
+if [ -z "$AREA_OFFSET" ] || [ -z "$AREA_LENGTH" ]; then
     die "could not parse Area offset/length for keyslot $SLOT from luksDump output"
+fi
 
 echo "Keyslot $SLOT: Area offset=$AREA_OFFSET bytes, Area length=$AREA_LENGTH bytes"
 echo
