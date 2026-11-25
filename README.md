@@ -164,8 +164,9 @@ sudo ./scripts/recover-passphrase /dev/sdX 'my-best-guess-passphrase'
 ```
 
 Tests the guess itself, then candidates one edit away from it
-(substitutions by neighbouring keys and shift pairs, deletions, and
-insertions of digits and common symbols), each with
+(substitutions by neighbouring keys and shift pairs, deletions,
+insertions of digits and common symbols, and swaps of two adjacent
+characters), each with
 `cryptsetup open --test-passphrase`, which never activates the device.
 An image file of the device needs no root. It does not cover every
 one-character difference: uppercase slips and missing letters are not
@@ -207,9 +208,6 @@ in this repo:
 - **Edit-distance-2 search.** Covering two simultaneous slips, with
   appropriate warnings about the combinatorial growth in candidate
   count (and therefore Argon2id wall-clock cost) as distance increases.
-- **Transposition (adjacent character swap).** Full Damerau-Levenshtein
-  distance 1 currently omits this fourth edit operation; it's a
-  plausible addition to the existing three.
 - **Integration with GPU-accelerated tools** like `hashcat`'s or
   `john`'s LUKS modes for cases that genuinely need larger search
   spaces than a CPU-bound `--test-passphrase` loop can cover in
@@ -227,7 +225,7 @@ in this repo:
   and `scripts/inspect-keyslot` are POSIX `sh` today, which keeps them
   auditable and dependency-free but means candidate generation is
   inherently slower than a compiled implementation, which matters as
-  search space grows (edit-distance-2, transposition, dictionary
+  search space grows (edit-distance-2, wider candidate sets, dictionary
   search — all listed above). Scoping work would need to weigh: each
   `cryptsetup open --test-passphrase` call spends about 2 seconds in
   Argon2id with default settings, which dominates the run time

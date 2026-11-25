@@ -71,7 +71,7 @@ device at all, and it tests the guess itself first: if the guess
 already works, it says so, since the problem is then not the
 passphrase.
 
-## The three edits
+## The four edits
 
 From the base guess, the script generates every candidate reachable by
 one of these edits at any position, removes duplicates, and tests them
@@ -92,17 +92,24 @@ in that order:
    the set `0123456789!@#$%^&*_-.` (change it with `--insert-chars`).
    **A letter missing from your guess is not found** unless you add
    letters to that set.
+4. **Transposition**: two adjacent characters swapped, for example
+   `Tnago` for `Tango`. Swapping two equal characters gives the guess
+   back, so those pairs are skipped.
 
-These are the operations of Levenshtein distance 1 (substitution,
-deletion and insertion), but the script tries only some of the
-possible substitutions and insertions, so it searches a subset of the
-passphrases within distance 1. It does not try swapping two adjacent
-characters (transposition); see the [Roadmap](../README.md#roadmap).
+These are the four errors of Damerau's spelling-correction method: "a
+wrong, missing or extra letter or a single transposition" (F. J.
+Damerau, "A technique for computer detection and correction of
+spelling errors", *Communications of the ACM* 7(3), pp. 171–176, 1964,
+DOI [10.1145/363958.363994](https://doi.org/10.1145/363958.363994)).
+The script tries only some of the possible substitutions and
+insertions, so it searches a subset of the passphrases one such error
+away.
 
 In the experiment, with the passphrase `Tango-ok7`, the script
 recovered it from `Tango-okk7` (deletion), `Tango-ol7` (`l` for its
-neighbour `k`) and `Tango-ok` (inserting `7`), but not from `Tango-o7`
-(a missing letter) or `Rango-ok7` (an uppercase slip).
+neighbour `k`), `Tango-ok` (inserting `7`) and `Tnago-ok7` (swapping
+`n` and `a`), but not from `Tango-o7` (a missing letter) or
+`Rango-ok7` (an uppercase slip).
 
 ## Usage walkthrough
 
@@ -123,13 +130,13 @@ guess `Tango-okk7` (lines 8 to 53, all "no match", are left out):
 ```
 luks-doctor: testing keyslot(s) on ./device.img
 luks-doctor: base guess: Tango-okk7
-luks-doctor: generated 280 candidates (substitution + deletion + insertion)
+luks-doctor: generated 288 candidates (substitution + deletion + insertion + transposition)
 luks-doctor: testing the base guess itself... no match
-luks-doctor: [1/280] testing candidate (substitution, pos 1)... no match
-luks-doctor: [2/280] testing candidate (substitution, pos 1)... no match
-luks-doctor: [3/280] testing candidate (substitution, pos 1)... no match
+luks-doctor: [1/288] testing candidate (substitution, pos 1)... no match
+luks-doctor: [2/288] testing candidate (substitution, pos 1)... no match
+luks-doctor: [3/288] testing candidate (substitution, pos 1)... no match
 ...
-luks-doctor: [50/280] testing candidate (deletion, pos 7)... MATCH
+luks-doctor: [50/288] testing candidate (deletion, pos 7)... MATCH
 
 luks-doctor: recovered passphrase:
   Tango-okk7   (original guess, for reference)
@@ -162,8 +169,8 @@ on a machine where that matters as little as possible, and change the
 passphrase afterwards, as the script's own reminder says.
 
 `./scripts/recover-passphrase --help` lists the options: `--layout`,
-`--no-substitution`, `--no-deletion`, `--no-insertion` and
-`--insert-chars`.
+`--no-substitution`, `--no-deletion`, `--no-insertion`,
+`--no-transposition` and `--insert-chars`.
 
 ## Keyboard layouts
 
@@ -196,6 +203,6 @@ wrong.
 
 ---
 
-For what is deliberately not built yet (larger edit distances,
-transposition, a Dvorak table, dictionary-based candidates, GPU
-search), see the [Roadmap section of the README](../README.md#roadmap).
+For what is deliberately not built yet (larger edit distances, wider
+substitution and insertion sets, a Dvorak table, dictionary-based
+candidates, GPU search), see the [Roadmap section of the README](../README.md#roadmap).
