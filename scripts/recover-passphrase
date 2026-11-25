@@ -102,7 +102,10 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-[ -n "$DEVICE" ] && [ -n "$GUESS" ] || { usage >&2; exit 1; }
+if [ -z "$DEVICE" ] || [ -z "$GUESS" ]; then
+    usage >&2
+    exit 1
+fi
 [ -b "$DEVICE" ] || [ -f "$DEVICE" ] || die "$DEVICE is not a block device or file"
 command -v cryptsetup >/dev/null 2>&1 || die "cryptsetup not found in PATH"
 case "$LAYOUT" in
