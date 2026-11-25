@@ -350,6 +350,63 @@ shift_pair() {
     fi
 }
 
+# to_upper CHAR / to_lower CHAR -> the other case of a single ASCII
+# letter; any other character is printed unchanged. The letter's
+# position in one alphabet string is looked up in the other, which
+# keeps this independent of the locale (unlike tr ranges).
+LOWER_ALPHA='abcdefghijklmnopqrstuvwxyz'
+UPPER_ALPHA='ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+
+to_upper() {
+    case "$1" in
+        [a-z])
+            _head="${LOWER_ALPHA%%"$1"*}"
+            char_at "$UPPER_ALPHA" "${#_head}"
+            ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+to_lower() {
+    case "$1" in
+        [A-Z])
+            _head="${UPPER_ALPHA%%"$1"*}"
+            char_at "$LOWER_ALPHA" "${#_head}"
+            ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+# shifted_neighbours CHAR -> what a finger holding Shift types when it
+# slips from the uppercase letter CHAR to a neighbouring key: the
+# neighbours of its lowercase form, with letters in uppercase and
+# number-row keys as the character that row types with Shift (the
+# shift_pair symbol, except on AZERTY where Shift gives the number).
+shifted_neighbours() {
+    _lower="$(to_lower "$1")"
+    _adj="$(adjacent_chars "$_lower")"
+    _adjlen=${#_adj}
+    _out=""
+    _k=0
+    while [ "$_k" -lt "$_adjlen" ]; do
+        _n="$(char_at "$_adj" "$_k")"
+        case "$_n" in
+            [0-9])
+                if [ "$LAYOUT" = "azerty" ]; then
+                    _out="${_out}${_n}"
+                else
+                    _out="${_out}$(shift_pair_common "$_n")"
+                fi
+                ;;
+            *)
+                _out="${_out}$(to_upper "$_n")"
+                ;;
+        esac
+        _k=$((_k + 1))
+    done
+    printf '%s' "$_out"
+}
+
 # POSIX-safe substring helpers, replacing bash's ${var:offset:length}.
 # Positions are 0-based on input/output to match the original bash
 # indexing; internally these convert to `cut -c`'s 1-based, inclusive
@@ -403,7 +460,10 @@ if [ "$DO_SUBSTITUTION" -eq 1 ]; then
     i=0
     while [ "$i" -lt "$len" ]; do
         ch="$(char_at "$GUESS" "$i")"
-        repl="$(adjacent_chars "$ch")$(shift_pair "$ch")"
+        case "$ch" in
+            [A-Z]) repl="$(shifted_neighbours "$ch")$(shift_pair "$ch")" ;;
+            *)     repl="$(adjacent_chars "$ch")$(shift_pair "$ch")" ;;
+        esac
         replen=${#repl}
         j=0
         while [ "$j" -lt "$replen" ]; do
