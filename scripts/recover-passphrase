@@ -29,7 +29,7 @@ Search for a working LUKS2 passphrase within edit distance 1 of a
 known-good guess, using safe non-activating verification
 (cryptsetup open --test-passphrase). Intended for the case where you
 are highly confident of a passphrase but suspect exactly one typo'd,
-dropped, or extra character. Not a general brute-force tool - see
+dropped, extra, or swapped character. Not a general brute-force tool - see
 docs/passphrase-recovery.md.
 
 Options:
