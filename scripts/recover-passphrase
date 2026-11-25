@@ -3,9 +3,10 @@
 # Copyright (C) 2026 Mohammadreza Khellat <mkhellat@beavernets.com>
 #
 # recover-passphrase - bounded edit-distance-1 search for a nearly-
-# correct LUKS2 passphrase (one substitution, deletion, or insertion
-# away from a known-good guess). Uses `cryptsetup open --test-passphrase`,
-# which verifies without activating/mapping the device. See
+# correct LUKS2 passphrase (one substitution, deletion, insertion, or
+# adjacent-character transposition away from a known-good guess). Uses
+# `cryptsetup open --test-passphrase`, which verifies without
+# activating/mapping the device. See
 # docs/passphrase-recovery.md for the methodology and why this is
 # deliberately NOT a general password-cracking tool.
 
@@ -16,6 +17,7 @@ PROG="$(basename "$0")"
 DO_SUBSTITUTION=1
 DO_DELETION=1
 DO_INSERTION=1
+DO_TRANSPOSITION=1
 INSERT_CHARS='0123456789!@#$%^&*_-.'
 LAYOUT='qwerty'
 
@@ -38,6 +40,7 @@ Options:
   --no-substitution      Skip keyboard-adjacency / shift-symbol substitution candidates.
   --no-deletion          Skip single-character deletion candidates.
   --no-insertion         Skip single-character insertion candidates.
+  --no-transposition     Skip adjacent-character transposition candidates.
   --insert-chars STR     Character set to try inserting (default: $INSERT_CHARS).
   -h, --help             Show this help and exit.
 
@@ -74,6 +77,10 @@ while [ $# -gt 0 ]; do
             ;;
         --no-insertion)
             DO_INSERTION=0
+            shift
+            ;;
+        --no-transposition)
+            DO_TRANSPOSITION=0
             shift
             ;;
         --insert-chars)
@@ -433,6 +440,22 @@ if [ "$DO_INSERTION" -eq 1 ]; then
     done
 fi
 
+# Transposition swaps the characters at 0-based positions i and i+1.
+# Swapping two equal characters gives back the guess itself, so those
+# pairs are skipped.
+if [ "$DO_TRANSPOSITION" -eq 1 ]; then
+    i=0
+    while [ "$((i + 1))" -lt "$len" ]; do
+        c1="$(char_at "$GUESS" "$i")"
+        c2="$(char_at "$GUESS" $((i + 1)))"
+        if [ "$c1" != "$c2" ]; then
+            candidate="$(substr_range "$GUESS" 0 "$i")${c2}${c1}$(substr_from "$GUESS" $((i + 2)))"
+            add_candidate "$candidate" "transposition, pos $i"
+        fi
+        i=$((i + 1))
+    done
+fi
+
 # Different edits can produce the same string (deleting either 'l' of
 # "ll", for example). Each test costs a full KDF run, so keep only the
 # first occurrence of each candidate.
@@ -447,7 +470,7 @@ cryptsetup isLuks "$DEVICE" 2>/dev/null ||
 
 echo "luks-doctor: testing keyslot(s) on $DEVICE"
 echo "luks-doctor: base guess: $GUESS"
-echo "luks-doctor: generated $total candidates (substitution + deletion + insertion)"
+echo "luks-doctor: generated $total candidates (substitution + deletion + insertion + transposition)"
 
 # Test one candidate. Returns 0 if it unlocks a keyslot and 1 if
 # cryptsetup reports a wrong passphrase (exit status 2, "no permission
