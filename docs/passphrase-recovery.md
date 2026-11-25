@@ -71,7 +71,7 @@ device at all, and it tests the guess itself first: if the guess
 already works, it says so, since the problem is then not the
 passphrase.
 
-## The four edits
+## The edits
 
 From the base guess, the script generates every candidate reachable by
 one of these edits at any position, removes duplicates, and tests them
@@ -81,35 +81,44 @@ in that order:
    on the keyboard, or by the character sharing its key with Shift
    (for example `s` for `a`, or `@` for `2`). The neighbours come from
    a table for the chosen layout (see
-   [Keyboard layouts](#keyboard-layouts)). The tables cover lowercase
+   [Keyboard layouts](#keyboard-layouts)), which covers the lowercase
    letters and digits, and the Shift table covers digits and common
-   symbols; **an uppercase letter gets no substitution candidates**,
-   and nothing tries changing a letter's case.
+   symbols. An **uppercase** letter is handled as a Shift slip from its
+   own key: its neighbours are offered in uppercase, and a neighbouring
+   number key as the symbol Shift types there (so `R`, `Y`, `F`, `G`
+   for `T` on QWERTY). A letter's own case is not changed here; that is
+   a separate edit (5).
 2. **Deletion**: one character removed. This finds a passphrase that
    is one character shorter than what you type, for instance because a
    keystroke did not register when the passphrase was set.
-3. **Insertion**: one character added at any position, but only from
-   the set `0123456789!@#$%^&*_-.` (change it with `--insert-chars`).
-   **A letter missing from your guess is not found** unless you add
-   letters to that set.
+3. **Insertion**: one character added at any position. By default the
+   inserted character comes only from the set `0123456789!@#$%^&*_-.`
+   (change it with `--insert-chars`); a missing **letter** is found
+   only with `--insert-letters`, which also tries each of `a`–`z`.
+   Letters are opt-in because adding 26 characters at every position
+   roughly doubles the candidate count, and so the search time.
 4. **Transposition**: two adjacent characters swapped, for example
    `Tnago` for `Tango`. Swapping two equal characters gives the guess
    back, so those pairs are skipped.
+5. **Case flip**: one letter's case inverted, for example `t` for `T`
+   — a stray Shift or Caps Lock. Non-letters are skipped.
 
-These are the four errors of Damerau's spelling-correction method: "a
-wrong, missing or extra letter or a single transposition" (F. J.
+The first four are the errors of Damerau's spelling-correction method:
+"a wrong, missing or extra letter or a single transposition" (F. J.
 Damerau, "A technique for computer detection and correction of
 spelling errors", *Communications of the ACM* 7(3), pp. 171–176, 1964,
-DOI [10.1145/363958.363994](https://doi.org/10.1145/363958.363994)).
-The script tries only some of the possible substitutions and
-insertions, so it searches a subset of the passphrases one such error
-away.
+DOI [10.1145/363958.363994](https://doi.org/10.1145/363958.363994));
+the case flip is an addition beyond Damerau's set. The script tries
+only some of the possible substitutions and insertions, so it searches
+a subset of the passphrases one such edit away.
 
 In the experiment, with the passphrase `Tango-ok7`, the script
 recovered it from `Tango-okk7` (deletion), `Tango-ol7` (`l` for its
-neighbour `k`), `Tango-ok` (inserting `7`) and `Tnago-ok7` (swapping
-`n` and `a`), but not from `Tango-o7` (a missing letter) or
-`Rango-ok7` (an uppercase slip).
+neighbour `k`), `Tango-ok` (inserting `7`), `Tnago-ok7` (swapping `n`
+and `a`), `Rango-ok7` (`R` for the uppercase neighbour `T`) and
+`tango-ok7` (a case flip of `T`). The one case it still misses by
+default is `Tango-o7`, a missing letter — and that one too is
+recovered when the search is run with `--insert-letters`.
 
 ## Usage walkthrough
 
@@ -125,18 +134,18 @@ you own needs no root:
 ```
 
 Real output for an image whose passphrase is `Tango-ok7`, with the
-guess `Tango-okk7` (lines 8 to 53, all "no match", are left out):
+guess `Tango-okk7` (candidates 4 to 55, all "no match", are left out):
 
 ```
 luks-doctor: testing keyslot(s) on ./device.img
 luks-doctor: base guess: Tango-okk7
-luks-doctor: generated 288 candidates (substitution + deletion + insertion + transposition)
+luks-doctor: generated 302 candidates (substitution + deletion + insertion + transposition + case flip)
 luks-doctor: testing the base guess itself... no match
-luks-doctor: [1/288] testing candidate (substitution, pos 1)... no match
-luks-doctor: [2/288] testing candidate (substitution, pos 1)... no match
-luks-doctor: [3/288] testing candidate (substitution, pos 1)... no match
+luks-doctor: [1/302] testing candidate (substitution, pos 0)... no match
+luks-doctor: [2/302] testing candidate (substitution, pos 0)... no match
+luks-doctor: [3/302] testing candidate (substitution, pos 0)... no match
 ...
-luks-doctor: [50/288] testing candidate (deletion, pos 7)... MATCH
+luks-doctor: [56/302] testing candidate (deletion, pos 7)... MATCH
 
 luks-doctor: recovered passphrase:
   Tango-okk7   (original guess, for reference)
@@ -155,9 +164,9 @@ luks-doctor: SECURITY REMINDER
   volume protects anything sensitive.
 ```
 
-Positions count from 0. The search started at position 1 because the
-`T` at position 0 is uppercase. If nothing matches, the script says so
-and exits with status 1.
+Positions count from 0, so position 0 is the uppercase `T`, which now
+has substitution and case-flip candidates of its own. If nothing
+matches, the script says so and exits with status 1.
 
 **The guess is visible to other users while the script runs.** It is
 a command-line argument, and `/proc/pid/cmdline` "holds the complete
@@ -170,7 +179,8 @@ passphrase afterwards, as the script's own reminder says.
 
 `./scripts/recover-passphrase --help` lists the options: `--layout`,
 `--no-substitution`, `--no-deletion`, `--no-insertion`,
-`--no-transposition` and `--insert-chars`.
+`--no-transposition`, `--no-case-flip`, `--insert-chars` and
+`--insert-letters`.
 
 ## Keyboard layouts
 
@@ -203,6 +213,6 @@ wrong.
 
 ---
 
-For what is deliberately not built yet (larger edit distances, wider
-substitution and insertion sets, a Dvorak table, dictionary-based
-candidates, GPU search), see the [Roadmap section of the README](../README.md#roadmap).
+For what is deliberately not built yet (larger edit distances, a
+Dvorak table, dictionary-based candidates, GPU search), see the
+[Roadmap section of the README](../README.md#roadmap).

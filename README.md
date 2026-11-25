@@ -164,14 +164,16 @@ sudo ./scripts/recover-passphrase /dev/sdX 'my-best-guess-passphrase'
 ```
 
 Tests the guess itself, then candidates one edit away from it
-(substitutions by neighbouring keys and shift pairs, deletions,
-insertions of digits and common symbols, and swaps of two adjacent
-characters), each with
+(substitutions by neighbouring keys and shift pairs, including the
+uppercase neighbours of an uppercase letter; deletions; insertions of
+digits and common symbols; swaps of two adjacent characters; and
+flipping one letter's case), each with
 `cryptsetup open --test-passphrase`, which never activates the device.
 An image file of the device needs no root. It does not cover every
-one-character difference: uppercase slips and missing letters are not
-tried. See [`docs/passphrase-recovery.md`](docs/passphrase-recovery.md)
-for the full walkthrough and real example output.
+one-character difference: a missing letter is tried only with
+`--insert-letters`. See
+[`docs/passphrase-recovery.md`](docs/passphrase-recovery.md) for the
+full walkthrough and real example output.
 
 ```
 ./scripts/recover-passphrase --help
@@ -194,13 +196,6 @@ in this repo:
   covers `qwerty` (default), `azerty`, and `qwertz`. Dvorak arranges
   the keys differently enough that it would need its own adjacency
   table built from scratch rather than derived from the QWERTY one.
-- **Wider substitution and insertion sets.** Substitution covers only
-  lowercase letters, digits and shift/symbol pairs, and insertion only
-  digits and a few symbols, so an uppercase slip or a missing letter
-  is not found (see
-  [`experiments/passphrase-recovery/`](experiments/passphrase-recovery)).
-  Covering them, including case changes, would multiply the number of
-  candidates, each costing about 2 seconds with default Argon2id.
 - **Dictionary/mnemonic-based candidate generation.** For passphrases
   built from a memorable phrase or word list, generating candidates
   from likely word substitutions or common transformations (leetspeak,
