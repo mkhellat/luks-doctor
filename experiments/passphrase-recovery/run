@@ -62,6 +62,7 @@ search 'Tango-ol7'   'k typed as its neighbour l'
 search 'Tango-ok'    'final digit missing'
 search 'Tango-o7'    'letter missing'
 search 'Rango-ok7'   'uppercase T typed as its neighbour R'
+search 'Tnago-ok7'   'a and n swapped'
 
 echo
 echo "== A file that is not a LUKS device =="
