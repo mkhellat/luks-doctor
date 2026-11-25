@@ -20,6 +20,7 @@ DO_DELETION=1
 DO_INSERTION=1
 DO_TRANSPOSITION=1
 DO_CASE_FLIP=1
+INSERT_LETTERS=0
 INSERT_CHARS='0123456789!@#$%^&*_-.'
 LAYOUT='qwerty'
 
@@ -46,6 +47,11 @@ Options:
   --no-transposition     Skip adjacent-character transposition candidates.
   --no-case-flip         Skip candidates that flip the case of one letter.
   --insert-chars STR     Character set to try inserting (default: $INSERT_CHARS).
+  --insert-letters       Also try inserting each lowercase letter a-z
+                          (appended to the insertion character set).
+                          Off by default: it adds about 26 candidates
+                          per position, and each test costs a full KDF
+                          run (about 2 seconds with default Argon2id).
   -h, --help             Show this help and exit.
 
 Needs read access to the device: root for a block device, none for
@@ -89,6 +95,10 @@ while [ $# -gt 0 ]; do
             ;;
         --no-case-flip)
             DO_CASE_FLIP=0
+            shift
+            ;;
+        --insert-letters)
+            INSERT_LETTERS=1
             shift
             ;;
         --insert-chars)
@@ -494,6 +504,11 @@ if [ "$DO_DELETION" -eq 1 ]; then
 fi
 
 if [ "$DO_INSERTION" -eq 1 ]; then
+    # Applied after option parsing so it extends any --insert-chars value
+    # regardless of option order.
+    if [ "$INSERT_LETTERS" -eq 1 ]; then
+        INSERT_CHARS="${INSERT_CHARS}${LOWER_ALPHA}"
+    fi
     insert_len=${#INSERT_CHARS}
     i=0
     while [ "$i" -le "$len" ]; do
