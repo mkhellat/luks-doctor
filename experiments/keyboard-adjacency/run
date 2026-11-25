@@ -1,0 +1,59 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Mohammadreza Khellat <mkhellat@beavernets.com>
+# Run the keyboard-adjacency experiment.  See README.md.
+#
+# Two checks:
+#  1. Derive the adjacency tables from a physical ANSI key grid and
+#     confirm the model reproduces the script's QWERTY and QWERTZ tables
+#     exactly and matches its Dvorak table (keyboard_adjacency.py).
+#  2. End to end, confirm --layout dvorak recovers a neighbour slip made
+#     on a Dvorak keyboard that the default QWERTY layout does not.
+# Needs no root and touches no block device.  Everything is deleted on
+# exit.
+set -eu
+
+here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+repo=$(CDPATH='' cd -- "$here/../.." && pwd)
+rp=$repo/scripts/recover-passphrase
+
+for tool in cryptsetup python3 truncate; do
+	command -v "$tool" >/dev/null 2>&1 || {
+		echo "error: $tool is required" >&2
+		exit 1
+	}
+done
+
+echo "== Adjacency tables: model vs. the script =="
+python3 -I "$here/keyboard_adjacency.py" "$rp"
+
+work=$(mktemp -d)
+trap 'rm -rf -- "$work"' EXIT INT TERM
+
+echo
+echo "== End to end: a Dvorak neighbour slip =="
+pass='Tango-ok7'
+printf '%s' "$pass" > "$work/passphrase"
+img=$work/fast.img
+truncate -s 32M "$img"
+cryptsetup luksFormat --type luks2 --batch-mode \
+	--pbkdf pbkdf2 --pbkdf-force-iterations 1000 \
+	--key-file "$work/passphrase" "$img"
+
+# On Dvorak, d and g are adjacent keys (home row); on QWERTY they are
+# not. So 'Tando-ok7' for 'Tango-ok7' is a one-key slip on Dvorak only.
+guess='Tando-ok7'
+echo "Real passphrase: $pass"
+echo "Guess:           $guess   (d typed for its Dvorak neighbour g)"
+
+run_layout() {
+	echo
+	echo "-- --layout $1 --"
+	sh "$rp" --layout "$1" "$img" "$guess" 2>&1 |
+		sed -e "s|$work|<tmpdir>|g" |
+		grep -E 'generated|MATCH|no match found' |
+		grep -v -- '\.\.\. no match$' || true
+}
+
+run_layout dvorak
+run_layout qwerty

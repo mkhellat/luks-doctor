@@ -48,6 +48,8 @@ jobs:
         run: sh experiments/entropy-tests/run
       - name: passphrase-recovery
         run: sh experiments/passphrase-recovery/run
+      - name: keyboard-adjacency
+        run: sh experiments/keyboard-adjacency/run
 
   license-headers:
     runs-on: ubuntu-24.04
