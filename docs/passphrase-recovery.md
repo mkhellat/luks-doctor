@@ -195,13 +195,19 @@ substitution:
   or other non-ASCII characters and are left out.
 - **`qwertz`**: German QWERTZ, the QWERTY table with `y` and `z`
   swapped.
+- **`dvorak`**: US Dvorak (Simplified). The same physical ANSI keys as
+  QWERTY with the letters rearranged, so `d` and `g` are neighbours, for
+  instance, where on QWERTY they are not. The number row is unchanged.
 
-The tables are written into the script; they were derived from the
-standard layouts by hand, not from a keymap file. Pick the layout the
-passphrase was typed on when the slip happened. If the layout is not
-listed (Dvorak, for example, which is on the
-[Roadmap](../README.md#roadmap)), `qwerty` is still worth trying:
-deletion and insertion do not depend on the layout.
+The tables are written into the script. The QWERTY, QWERTZ and Dvorak
+tables are checked against a physical ANSI key grid by
+[`experiments/keyboard-adjacency/`](../experiments/keyboard-adjacency):
+the same grid reproduces QWERTY and QWERTZ exactly, which is the
+evidence that it also derives Dvorak correctly. AZERTY, an ISO layout
+with a different physical arrangement, was derived by hand instead. Pick
+the layout the passphrase was typed on when the slip happened. If the
+layout is not listed, `qwerty` is still worth trying: deletion and
+insertion do not depend on the layout.
 
 Passphrases with non-ASCII characters have not been tested. The
 script counts characters with the shell's `${#var}` and picks them out
@@ -213,6 +219,6 @@ wrong.
 
 ---
 
-For what is deliberately not built yet (larger edit distances, a
-Dvorak table, dictionary-based candidates, GPU search), see the
+For what is deliberately not built yet (larger edit distances,
+dictionary-based candidates, GPU search), see the
 [Roadmap section of the README](../README.md#roadmap).
