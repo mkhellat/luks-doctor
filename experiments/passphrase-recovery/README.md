@@ -17,6 +17,11 @@ passphrase is `Tango-ok7`:
   option (the default insertion set is digits and `!@#$%^&*_-.`), and
   does not recover a missing uppercase letter even with it (the
   letters it inserts are lowercase);
+- at the default edit distance 1, does not recover a guess two slips
+  away (`Rango-ol7` — an uppercase neighbour `R` for `T` and a
+  neighbour `l` for `k`), but recovers it with `--edit-distance 2`,
+  which combines two edits at the cost of a much larger candidate set
+  (here, with `--no-insertion`, 2045 candidates instead of 65);
 - tests the guess itself first, and reports when it already works;
 - stops with an error, instead of testing candidates, when the target
   is not a LUKS device;
@@ -31,7 +36,8 @@ Used in [`docs/passphrase-recovery.md`](../../docs/passphrase-recovery.md).
 
 `cryptsetup`, `truncate`, `sha256sum`, and a `date` that supports `%N`
 (GNU coreutils). No root. The default-Argon2id image needs up to 1 GiB
-of RAM. A run takes about a minute.
+of RAM. A run takes about two minutes (the edit-distance-2 case tests a
+couple of thousand candidates).
 
 ## Run
 
@@ -43,7 +49,7 @@ For each guess, the output shows the search summary lines from
 `recover-passphrase` (the many "no match" lines are filtered out), its
 exit status, and whether the image's SHA-256 changed during the search.
 
-## Result (2026-11-25)
+## Result (2026-11-26)
 
 ```
 cryptsetup 2.8.9 flags: UDEV BLKID KEYRING KERNEL_CAPI HW_OPAL 
@@ -110,14 +116,27 @@ luks-doctor: [402/475] testing candidate (insertion, pos 7)... MATCH
    exit status: 0
    image unchanged by the search
 
+== Guess 'Rango-ol7' (two neighbour slips, distance 1 (no match)) ==
+luks-doctor: generated 65 candidates (substitution + deletion + insertion + transposition + case flip)
+luks-doctor: no match found among 65 edit-distance-1 candidates.
+   exit status: 1
+   image unchanged by the search
+
+== Guess 'Rango-ol7' (two neighbour slips, distance 2 (match)) ==
+luks-doctor: generated 2045 candidates at edit distance 2 (two of: substitution, deletion, insertion, transposition, case flip)
+luks-doctor: [1462/2045] testing candidate (substitution, pos 0 (2nd edit))... MATCH
+  Tango-ok7    (working passphrase - substitution, pos 0 (2nd edit))
+   exit status: 0
+   image unchanged by the search
+
 == A file that is not a LUKS device ==
 recover-passphrase: error: <tmpdir>/notluks.img is not a LUKS device (or cannot be read)
 
 == Time for one --test-passphrase with default Argon2id ==
-	Time cost:  4
-	Memory:     645801
+	Time cost:  5
+	Memory:     1048576
 	Threads:    4
-   wrong passphrase: exit status 2, 1919 ms
-   wrong passphrase: exit status 2, 1860 ms
-   wrong passphrase: exit status 2, 1939 ms
+   wrong passphrase: exit status 2, 1845 ms
+   wrong passphrase: exit status 2, 1942 ms
+   wrong passphrase: exit status 2, 2083 ms
 ```
