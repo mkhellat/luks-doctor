@@ -491,6 +491,10 @@ defaults are `xts-plain64`). The XTS tweak mechanism is IEEE Std
 1619-2007; its call chain inside Linux is the blue step in the
 [key-lifecycle call graph](#key-lifecycle-call-graph).
 
+A browsable version of this diagram, with pan, zoom and search, is at
+[`docs/diagrams/tweak-iv.html`](diagrams/tweak-iv.html). Open it in a
+browser; it loads Mermaid and its fonts from a CDN.
+
 ## Userspace unlock path
 
 The two diagrams above live inside the kernel; they begin where
@@ -595,3 +599,7 @@ depth). The device-mapper ioctl layer (`lib/libdevmapper.c`) is not
 traced here; the kernel side it reaches is the [key-lifecycle call
 graph](#key-lifecycle-call-graph) and [Tweak/IV
 generation](#tweakiv-generation).
+
+A browsable version of this diagram, with pan, zoom and search, is at
+[`docs/diagrams/unlock-path.html`](diagrams/unlock-path.html). Open it
+in a browser; it loads Mermaid and its fonts from a CDN.
