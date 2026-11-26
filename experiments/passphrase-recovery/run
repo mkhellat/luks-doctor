@@ -69,6 +69,12 @@ search 'Rango-ok7'   'uppercase T typed as its neighbour R'
 search 'Tnago-ok7'   'a and n swapped'
 search 'tango-ok7'   'T typed as t'
 search 'Tango-o7'    'letter missing, with --insert-letters' --insert-letters
+# Two slips at once (uppercase neighbour R for T, and l for k): out of
+# reach at the default edit distance 1, recovered at edit distance 2.
+# --no-insertion keeps the distance-2 candidate set small enough to run
+# quickly here.
+search 'Rango-ol7'   'two neighbour slips, distance 1 (no match)'   --no-insertion
+search 'Rango-ol7'   'two neighbour slips, distance 2 (match)'      --no-insertion --edit-distance 2
 
 echo
 echo "== A file that is not a LUKS device =="
