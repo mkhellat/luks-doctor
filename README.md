@@ -15,10 +15,14 @@ narrowly-scoped passphrase-recovery technique.**
    tools, and how to tell real corruption apart from LUKS2's normal,
    by-design quirks (like the primary and secondary headers legitimately
    differing from each other). See [`docs/`](docs/).
-2. **One recovery script** implementing a bounded edit-distance search
-   (one slip by default, two with `--edit-distance 2`) for a passphrase
-   you're highly confident about but suspect you fat-fingered by a
-   character or two.
+2. **Two recovery scripts.** `scripts/recover-passphrase` implements a
+   bounded edit-distance search (one slip by default, two with
+   `--edit-distance 2`) for a passphrase you're highly confident about
+   but suspect you fat-fingered by a character or two.
+   `scripts/recover-dictionary` searches a wordlist instead, applying the
+   common human transformations (capitalization, leetspeak, an appended
+   number or year, word separators) for a passphrase built from a word
+   or phrase.
 
 It is deliberately **not**:
 
@@ -118,6 +122,9 @@ and secondary headers legitimately differ — is in
 - [`docs/passphrase-recovery.md`](docs/passphrase-recovery.md) — the
   edit-distance search in detail, why it's safe, and which slips it
   does and does not recover.
+- [`docs/dictionary-recovery.md`](docs/dictionary-recovery.md) — the
+  wordlist-based search: the transformations it applies, the wordlist
+  options, and why a full dictionary is out of reach against Argon2id.
 - [`docs/cold-boot-and-dma-attacks.md`](docs/cold-boot-and-dma-attacks.md) —
   a deliberately separate threat model: attacking the cleartext master
   key while it's resident in memory on an already-unlocked, running
@@ -186,6 +193,28 @@ Only reach for this after confirming (via `inspect-keyslot` and
 that the header and keyslot data actually look clean — this tool
 recovers typos, not disk damage.
 
+### Recover a wordlist-based passphrase
+
+```
+./scripts/recover-dictionary --wordlist ./words /dev/sdX
+```
+
+For a passphrase built from a word or phrase rather than fat-fingered
+from a known one. For each entry in the wordlist it tries capitalization
+variants, a leetspeak form, an appended number or year, and (for
+multi-word entries) different separators, testing each with
+`cryptsetup open --test-passphrase`. The wordlist defaults to
+`/usr/share/dict/words` when it exists. Because every candidate runs the
+keyslot KDF, this is practical only for a short, targeted list or a fast
+keyslot KDF — the script prints a candidate count and time estimate and
+warns before testing. See
+[`docs/dictionary-recovery.md`](docs/dictionary-recovery.md) for the
+transformations, the limits, and real example output.
+
+```
+./scripts/recover-dictionary --help
+```
+
 ## Roadmap
 
 The documentation aims to be genuinely comprehensive about LUKS2
@@ -194,10 +223,6 @@ following are plausible, not-yet-built extensions — ideas and
 contributions welcome, but none of these are half-implemented anywhere
 in this repo:
 
-- **Dictionary/mnemonic-based candidate generation.** For passphrases
-  built from a memorable phrase or word list, generating candidates
-  from likely word substitutions or common transformations (leetspeak,
-  capitalization changes) rather than pure character-level edits.
 - **Integration with GPU-accelerated tools** like `hashcat`'s or
   `john`'s LUKS modes for cases that genuinely need larger search
   spaces than a CPU-bound `--test-passphrase` loop can cover in
@@ -215,9 +240,9 @@ in this repo:
   and `scripts/inspect-keyslot` are POSIX `sh` today, which keeps them
   auditable and dependency-free but means candidate generation is
   inherently slower than a compiled implementation, which matters as the
-  search space grows — `--edit-distance 2` already generates thousands
-  of candidates in `sh`, and the dictionary search on the roadmap would
-  push it further. Scoping work would need to weigh: each
+  search space grows — `--edit-distance 2` and `recover-dictionary`
+  already generate thousands of candidates in `sh`. Scoping work would
+  need to weigh: each
   `cryptsetup open --test-passphrase` call spends about 2 seconds in
   Argon2id with default settings, which dominates the run time
   regardless of language; whether a rewrite
