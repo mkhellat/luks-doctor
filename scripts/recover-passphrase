@@ -23,6 +23,7 @@ DO_CASE_FLIP=1
 INSERT_LETTERS=0
 INSERT_CHARS='0123456789!@#$%^&*_-.'
 LAYOUT='qwerty'
+EDIT_DISTANCE=1
 
 usage() {
     cat <<EOF
@@ -52,6 +53,13 @@ Options:
                           Off by default: it adds about 26 candidates
                           per position, and each test costs a full KDF
                           run (about 2 seconds with default Argon2id).
+  --edit-distance N      Number of edits to combine: 1 (default) or 2.
+                          Distance 2 applies two of the edits above and
+                          the candidate count grows roughly as the
+                          square of the distance-1 count (tens of
+                          thousands for a typical passphrase), each a
+                          full KDF run. Use the --no-* options and/or a
+                          fast keyslot KDF to keep it tractable.
   -h, --help             Show this help and exit.
 
 Needs read access to the device: root for a block device, none for
@@ -111,6 +119,11 @@ while [ $# -gt 0 ]; do
             LAYOUT="$2"
             shift 2
             ;;
+        --edit-distance)
+            [ $# -ge 2 ] || die "--edit-distance requires an argument"
+            EDIT_DISTANCE="$2"
+            shift 2
+            ;;
         -*)
             die "unknown option: $1 (see --help)"
             ;;
@@ -136,6 +149,10 @@ command -v cryptsetup >/dev/null 2>&1 || die "cryptsetup not found in PATH"
 case "$LAYOUT" in
     qwerty|azerty|qwertz|dvorak) ;;
     *) die "unknown --layout '$LAYOUT' (supported: qwerty, azerty, qwertz, dvorak)" ;;
+esac
+case "$EDIT_DISTANCE" in
+    1|2) ;;
+    *) die "unsupported --edit-distance '$EDIT_DISTANCE' (supported: 1, 2)" ;;
 esac
 
 [ -r "$DEVICE" ] ||
@@ -509,106 +526,132 @@ substr_range() {
     fi
 }
 
-len=${#GUESS}
-
 # POSIX sh has no arrays, so candidates and their labels are accumulated
 # as newline-delimited records ("candidate<TAB>label") in a temp file
 # instead of bash's CANDIDATES=()/LABELS=() arrays. This is cleaned up
 # on exit via a trap.
 CAND_FILE="$(mktemp)"
-trap 'rm -f "$CAND_FILE" "$CAND_FILE.uniq"' EXIT INT TERM
+trap 'rm -f "$CAND_FILE" "$CAND_FILE.uniq" "$CAND_FILE.l1"' EXIT INT TERM
 
 add_candidate() {
     printf '%s\t%s\n' "$1" "$2" >>"$CAND_FILE"
 }
 
-if [ "$DO_SUBSTITUTION" -eq 1 ]; then
-    i=0
-    while [ "$i" -lt "$len" ]; do
-        ch="$(char_at "$GUESS" "$i")"
-        case "$ch" in
-            [ABCDEFGHIJKLMNOPQRSTUVWXYZ]) repl="$(shifted_neighbours "$ch")$(shift_pair "$ch")" ;;
-            *)     repl="$(adjacent_chars "$ch")$(shift_pair "$ch")" ;;
-        esac
-        replen=${#repl}
-        j=0
-        while [ "$j" -lt "$replen" ]; do
-            rc="$(char_at "$repl" "$j")"
-            candidate="$(substr_range "$GUESS" 0 "$i")${rc}$(substr_from "$GUESS" $((i + 1)))"
-            add_candidate "$candidate" "substitution, pos $i"
-            j=$((j + 1))
+# --insert-letters extends the insertion set once, here, rather than
+# inside the generator (which may run thousands of times for
+# --edit-distance 2), so the letters are appended exactly once
+# regardless of option order.
+if [ "$DO_INSERTION" -eq 1 ] && [ "$INSERT_LETTERS" -eq 1 ]; then
+    INSERT_CHARS="${INSERT_CHARS}${LOWER_ALPHA}"
+fi
+insert_len=${#INSERT_CHARS}
+
+# generate_edits BASE SUFFIX -- append every enabled single-character
+# edit of BASE to CAND_FILE, with SUFFIX added to each candidate's label
+# (empty for the first edit, " (2nd edit)" for the second pass). This is
+# the whole distance-1 search; --edit-distance 2 runs it again over each
+# distance-1 candidate. Underscore-prefixed locals avoid clobbering the
+# distance-2 driver's loop variable.
+generate_edits() {
+    _base="$1"
+    _sfx="$2"
+    _blen=${#_base}
+
+    if [ "$DO_SUBSTITUTION" -eq 1 ]; then
+        _i=0
+        while [ "$_i" -lt "$_blen" ]; do
+            _ch="$(char_at "$_base" "$_i")"
+            case "$_ch" in
+                [ABCDEFGHIJKLMNOPQRSTUVWXYZ]) _repl="$(shifted_neighbours "$_ch")$(shift_pair "$_ch")" ;;
+                *)     _repl="$(adjacent_chars "$_ch")$(shift_pair "$_ch")" ;;
+            esac
+            _replen=${#_repl}
+            _j=0
+            while [ "$_j" -lt "$_replen" ]; do
+                _rc="$(char_at "$_repl" "$_j")"
+                _cand="$(substr_range "$_base" 0 "$_i")${_rc}$(substr_from "$_base" $((_i + 1)))"
+                add_candidate "$_cand" "substitution, pos $_i$_sfx"
+                _j=$((_j + 1))
+            done
+            _i=$((_i + 1))
         done
-        i=$((i + 1))
-    done
-fi
-
-if [ "$DO_DELETION" -eq 1 ]; then
-    i=0
-    while [ "$i" -lt "$len" ]; do
-        candidate="$(substr_range "$GUESS" 0 "$i")$(substr_from "$GUESS" $((i + 1)))"
-        add_candidate "$candidate" "deletion, pos $i"
-        i=$((i + 1))
-    done
-fi
-
-if [ "$DO_INSERTION" -eq 1 ]; then
-    # Applied after option parsing so it extends any --insert-chars value
-    # regardless of option order.
-    if [ "$INSERT_LETTERS" -eq 1 ]; then
-        INSERT_CHARS="${INSERT_CHARS}${LOWER_ALPHA}"
     fi
-    insert_len=${#INSERT_CHARS}
-    i=0
-    while [ "$i" -le "$len" ]; do
-        j=0
-        while [ "$j" -lt "$insert_len" ]; do
-            ic="$(char_at "$INSERT_CHARS" "$j")"
-            candidate="$(substr_range "$GUESS" 0 "$i")${ic}$(substr_from "$GUESS" "$i")"
-            add_candidate "$candidate" "insertion, pos $i"
-            j=$((j + 1))
+
+    if [ "$DO_DELETION" -eq 1 ]; then
+        _i=0
+        while [ "$_i" -lt "$_blen" ]; do
+            _cand="$(substr_range "$_base" 0 "$_i")$(substr_from "$_base" $((_i + 1)))"
+            add_candidate "$_cand" "deletion, pos $_i$_sfx"
+            _i=$((_i + 1))
         done
-        i=$((i + 1))
-    done
-fi
+    fi
 
-# Transposition swaps the characters at 0-based positions i and i+1.
-# Swapping two equal characters gives back the guess itself, so those
-# pairs are skipped.
-if [ "$DO_TRANSPOSITION" -eq 1 ]; then
-    i=0
-    while [ "$((i + 1))" -lt "$len" ]; do
-        c1="$(char_at "$GUESS" "$i")"
-        c2="$(char_at "$GUESS" $((i + 1)))"
-        if [ "$c1" != "$c2" ]; then
-            candidate="$(substr_range "$GUESS" 0 "$i")${c2}${c1}$(substr_from "$GUESS" $((i + 2)))"
-            add_candidate "$candidate" "transposition, pos $i"
-        fi
-        i=$((i + 1))
-    done
-fi
+    if [ "$DO_INSERTION" -eq 1 ]; then
+        _i=0
+        while [ "$_i" -le "$_blen" ]; do
+            _j=0
+            while [ "$_j" -lt "$insert_len" ]; do
+                _ic="$(char_at "$INSERT_CHARS" "$_j")"
+                _cand="$(substr_range "$_base" 0 "$_i")${_ic}$(substr_from "$_base" "$_i")"
+                add_candidate "$_cand" "insertion, pos $_i$_sfx"
+                _j=$((_j + 1))
+            done
+            _i=$((_i + 1))
+        done
+    fi
 
-# Case flip changes the case of one ASCII letter (a Shift or Caps Lock
-# slip). Other characters have no case and are skipped.
-if [ "$DO_CASE_FLIP" -eq 1 ]; then
-    i=0
-    while [ "$i" -lt "$len" ]; do
-        ch="$(char_at "$GUESS" "$i")"
-        case "$ch" in
-            [abcdefghijklmnopqrstuvwxyz]) flipped="$(to_upper "$ch")" ;;
-            [ABCDEFGHIJKLMNOPQRSTUVWXYZ]) flipped="$(to_lower "$ch")" ;;
-            *)     flipped="" ;;
-        esac
-        if [ -n "$flipped" ]; then
-            candidate="$(substr_range "$GUESS" 0 "$i")${flipped}$(substr_from "$GUESS" $((i + 1)))"
-            add_candidate "$candidate" "case flip, pos $i"
-        fi
-        i=$((i + 1))
-    done
+    # Transposition swaps the characters at 0-based positions i and i+1.
+    # Swapping two equal characters gives back the base, so skip those.
+    if [ "$DO_TRANSPOSITION" -eq 1 ]; then
+        _i=0
+        while [ "$((_i + 1))" -lt "$_blen" ]; do
+            _c1="$(char_at "$_base" "$_i")"
+            _c2="$(char_at "$_base" $((_i + 1)))"
+            if [ "$_c1" != "$_c2" ]; then
+                _cand="$(substr_range "$_base" 0 "$_i")${_c2}${_c1}$(substr_from "$_base" $((_i + 2)))"
+                add_candidate "$_cand" "transposition, pos $_i$_sfx"
+            fi
+            _i=$((_i + 1))
+        done
+    fi
+
+    # Case flip changes the case of one ASCII letter (a Shift or Caps
+    # Lock slip). Other characters have no case and are skipped.
+    if [ "$DO_CASE_FLIP" -eq 1 ]; then
+        _i=0
+        while [ "$_i" -lt "$_blen" ]; do
+            _ch="$(char_at "$_base" "$_i")"
+            case "$_ch" in
+                [abcdefghijklmnopqrstuvwxyz]) _flipped="$(to_upper "$_ch")" ;;
+                [ABCDEFGHIJKLMNOPQRSTUVWXYZ]) _flipped="$(to_lower "$_ch")" ;;
+                *)     _flipped="" ;;
+            esac
+            if [ -n "$_flipped" ]; then
+                _cand="$(substr_range "$_base" 0 "$_i")${_flipped}$(substr_from "$_base" $((_i + 1)))"
+                add_candidate "$_cand" "case flip, pos $_i$_sfx"
+            fi
+            _i=$((_i + 1))
+        done
+    fi
+}
+
+# Distance 1: every single edit of the guess.
+generate_edits "$GUESS" ""
+
+# Distance 2: every single edit of each distinct distance-1 candidate.
+# The distance-1 candidates above are the bases for the second edit;
+# dedup them first so each base is expanded only once.
+if [ "$EDIT_DISTANCE" -ge 2 ]; then
+    cut -f1 "$CAND_FILE" | sort -u >"$CAND_FILE.l1"
+    while IFS= read -r _b1; do
+        generate_edits "$_b1" " (2nd edit)"
+    done <"$CAND_FILE.l1"
+    rm -f "$CAND_FILE.l1"
 fi
 
 # Different edits can produce the same string (deleting either 'l' of
-# "ll", for example). Each test costs a full KDF run, so keep only the
-# first occurrence of each candidate.
+# "ll", for example), and distance 2 collides heavily. Each test costs a
+# full KDF run, so keep only the first occurrence of each candidate.
 awk -F '\t' '!seen[$1]++' "$CAND_FILE" >"$CAND_FILE.uniq"
 mv "$CAND_FILE.uniq" "$CAND_FILE"
 
@@ -620,7 +663,18 @@ cryptsetup isLuks "$DEVICE" 2>/dev/null ||
 
 echo "luks-doctor: testing keyslot(s) on $DEVICE"
 echo "luks-doctor: base guess: $GUESS"
-echo "luks-doctor: generated $total candidates (substitution + deletion + insertion + transposition + case flip)"
+if [ "$EDIT_DISTANCE" -ge 2 ]; then
+    echo "luks-doctor: generated $total candidates at edit distance 2 (two of: substitution, deletion, insertion, transposition, case flip)"
+    _est_s=$((total * 2))
+    if [ "$_est_s" -ge 3600 ]; then
+        _est="about $((_est_s / 3600)) h $(( (_est_s % 3600) / 60 )) min"
+    else
+        _est="about $((_est_s / 60)) min"
+    fi
+    echo "luks-doctor: WARNING: this is a large search. At ~2 s per guess (cryptsetup's default Argon2id) it would take $_est; far less with a pbkdf2 keyslot. Each test is a full KDF run - narrow it with the --no-* options if you can."
+else
+    echo "luks-doctor: generated $total candidates (substitution + deletion + insertion + transposition + case flip)"
+fi
 
 # Test one candidate. Returns 0 if it unlocks a keyslot and 1 if
 # cryptsetup reports a wrong passphrase (exit status 2, "no permission
