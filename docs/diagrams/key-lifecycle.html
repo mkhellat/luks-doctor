@@ -619,13 +619,13 @@ flowchart TD
     <h2>Scope</h2>
     <p>
       This diagram covers only the master key's <strong>kernel-side
-      lifecycle</strong>. Two related diagrams are planned as separate work,
-      not yet built: tweak/IV generation (<code>iv_gen_ops</code>,
-      <code>crypt_iv_essiv</code>, referenced by the bio-dispatch layer above
-      but not traced here), and the full userspace-to-kernel unlock path
-      (keyslot unwrap, AF-merge, digest verification, the
-      <code>luksOpen</code> handoff into the graph above). Don't read this
-      page as covering either.
+      lifecycle</strong>. Two companion diagrams cover the rest: tweak/IV
+      generation — how dm-crypt produces the per-sector XTS tweak referenced
+      by the bio-dispatch layer above — in
+      <a href="tweak-iv.html">tweak-iv.html</a>, and the userspace unlock
+      path — keyslot unwrap, AF-merge, digest verification, and the
+      <code>luksOpen</code> hand-off into this graph — in
+      <a href="unlock-path.html">unlock-path.html</a>.
     </p>
   </section>
 
