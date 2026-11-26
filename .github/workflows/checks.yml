@@ -50,6 +50,8 @@ jobs:
         run: sh experiments/passphrase-recovery/run
       - name: keyboard-adjacency
         run: sh experiments/keyboard-adjacency/run
+      - name: dictionary-recovery
+        run: sh experiments/dictionary-recovery/run
 
   license-headers:
     runs-on: ubuntu-24.04
