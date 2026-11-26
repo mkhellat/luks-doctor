@@ -17,6 +17,7 @@ source pinned to a specific commit.
   - [In the kernel, while the volume is mapped](#in-the-kernel-while-the-volume-is-mapped)
 - [How the kernel uses the key](#how-the-kernel-uses-the-key)
 - [Key-lifecycle call graph](#key-lifecycle-call-graph)
+- [Tweak/IV generation](#tweakiv-generation)
 
 ## What the master key is
 
@@ -205,8 +206,10 @@ on which of three kernel implementations of `xts(aes)` the crypto API
 selects, and the per-sector path starts from a bio-submission chain.
 The diagram traces the key from `luksOpen` through per-sector I/O to
 `luksClose`, each edge checked against kernel source at the pinned
-commits in the table below. It covers only the key's lifecycle; it
-does not trace tweak/IV generation or the userspace unlock path.
+commits in the table below. It covers only the key's lifecycle;
+tweak/IV generation is traced in [Tweak/IV
+generation](#tweakiv-generation) below, and the userspace unlock path is
+left to a separate diagram.
 
 ```mermaid
 flowchart TD
@@ -371,3 +374,117 @@ rechecked on 2026-10-28:
 A browsable version of this diagram, with pan, zoom and search, is at
 [`docs/diagrams/key-lifecycle.html`](diagrams/key-lifecycle.html). Open
 it in a browser; it loads Mermaid and its fonts from a CDN.
+
+## Tweak/IV generation
+
+The [key-lifecycle call graph](#key-lifecycle-call-graph) traces the key
+into the cipher, but the cipher needs a second input alongside the data,
+and that one the graph does not cover. For XTS this second input is the
+**tweak**, which dm-crypt supplies per sector as an **initialization
+vector (IV)**. This section traces that
+derivation for the default cipher `aes-xts-plain64` (cryptsetup's
+default mode is `xts-plain64`;
+[`configure.ac`](https://gitlab.com/cryptsetup/cryptsetup/-/blob/bae21790d59897ac50e5471f953f76b3a58aeeb6/configure.ac)
+lines 791 and 796; see also
+[`af-splitting-explained.md`](af-splitting-explained.md)).
+
+The cipher string `aes-xts-plain64` names three things: the block
+cipher `aes`, the mode `xts`, and the IV generator `plain64`. `plain64`
+is the simplest generator — the IV is just the sector number. For each
+sector dm-crypt writes the 64-bit little-endian sector index into a
+zeroed 16-byte buffer (16 is `crypto_skcipher_ivsize()` for `xts(aes)`)
+and hands that buffer to the cipher. XTS then treats those 16 bytes as
+its tweak: it encrypts them once, with the *second* half of the key (the
+tweak key), to get the sector's initial tweak, then for each successive
+16-byte block multiplies the tweak by α in GF(2^128), so every sector —
+and every block within it — is enciphered under a different tweak. That tweak-encryption step is the `xts(aes)`
+skcipher's own work, shown in the [key-lifecycle call
+graph](#key-lifecycle-call-graph) (`crypto/xts.c`); this diagram covers
+only how dm-crypt produces the IV that feeds it.
+
+```mermaid
+flowchart TD
+    subgraph S0["0. One-time setup (luksOpen -&gt; crypt_ctr)"]
+        P0["cipher string 'aes-xts-plain64'<br/>mode = xts, ivmode = plain64"]
+        P1["crypt_ctr_ivmode()<br/>dm-crypt.c:2750"]
+        P2["cc-&gt;iv_gen_ops = &amp;crypt_iv_plain64_ops<br/>dm-crypt.c:2773-2774"]
+        P3["cc-&gt;iv_size = crypto_skcipher_ivsize(any_tfm(cc))<br/>dm-crypt.c:2757  (16 for xts(aes))"]
+        P4["cc-&gt;iv_offset = iv_offset table field (argv[2])<br/>dm-crypt.c:3294"]
+        P0 --> P1 -->|ivmode is plain64| P2
+    end
+
+    subgraph S1["1. Per sector (crypt_convert loop)"]
+        A0["ctx-&gt;cc_sector = sector + cc-&gt;iv_offset<br/>dm-crypt.c:1184"]
+        A1["crypt_convert_block_skcipher()<br/>dm-crypt.c:1352 (called at 1542)"]
+        A2["dmreq-&gt;iv_sector = ctx-&gt;cc_sector<br/>dm-crypt.c:1370"]
+        A3["if CRYPT_IV_LARGE_SECTORS:<br/>dmreq-&gt;iv_sector &gt;&gt;= cc-&gt;sector_shift<br/>dm-crypt.c:1371-1372"]
+        A4["org_iv = org_iv_of_dmreq(cc, dmreq)<br/>dm-crypt.c:1378"]
+        A0 --> A1 --> A2 --> A3 --> A4
+    end
+
+    subgraph S2["2. IV generation (plain64)"]
+        G1["cc-&gt;iv_gen_ops-&gt;generator(cc, org_iv, dmreq)<br/>dm-crypt.c:1399"]
+        G2["crypt_iv_plain64_gen()<br/>dm-crypt.c:371"]
+        G3["memset(iv, 0, cc-&gt;iv_size)<br/>dm-crypt.c:374"]
+        G4["*(__le64 *)iv = cpu_to_le64(dmreq-&gt;iv_sector)<br/>dm-crypt.c:375"]
+        G5["org_iv = 16 bytes:<br/>LE64 sector index, then 8 zero bytes"]
+        G1 --> G2 --> G3 --> G4 --> G5
+    end
+
+    subgraph S3["3. Hand the IV to the cipher"]
+        H1["memcpy(iv, org_iv, cc-&gt;iv_size)<br/>working copy, dm-crypt.c:1410"]
+        H2["skcipher_request_set_crypt(req, sg_in, sg_out,<br/>cc-&gt;sector_size, iv)<br/>dm-crypt.c:1413"]
+        H3["crypto_skcipher_encrypt(req) / _decrypt(req)<br/>dm-crypt.c:1416 / 1418"]
+        H1 --> H2 --> H3
+    end
+
+    subgraph S4["4. XTS tweak (crypto layer — see key-lifecycle diagram)"]
+        X1["xts(aes) skcipher receives the 16-byte IV as its tweak"]
+        X2["encrypt the tweak with the second AES key (tweak key)"]
+        X3["multiply by α in GF(2^128) once per 16-byte block<br/>IEEE Std 1619-2007"]
+        X1 --> X2 --> X3
+    end
+
+    P2 -.-> G1
+    P3 -.-> G3
+    A4 --> G1
+    G5 --> H1
+    H3 --> X1
+
+    classDef xref fill:#e7f1ff,stroke:#084298,color:#052c65
+    class X1,X2,X3 xref
+```
+
+The blue nodes are the XTS tweak step itself, performed by the
+`xts(aes)` skcipher and traced in the [key-lifecycle call
+graph](#key-lifecycle-call-graph); they are shown here only to connect
+dm-crypt's IV to the tweak it becomes.
+
+Three details are worth drawing out:
+
+- **The IV is the sector number, nothing more.** `plain64` does no
+  hashing or encryption of the sector index, unlike `essiv`, `eboiv` or
+  the diffuser modes. An attacker can predict every sector's IV; XTS is
+  designed so that this is safe, because the tweak is then enciphered
+  under a secret key inside the cipher.
+- **Which sector.** `iv_sector` counts from the start of the dm-crypt
+  mapping plus `iv_offset` (the `iv_offset` field of the dm-crypt
+  table, `argv[2]`), and for sector sizes above 512 bytes it is shifted
+  right so the IV counts in whole crypto sectors rather than 512-byte
+  units (`CRYPT_IV_LARGE_SECTORS`). With cryptsetup's defaults
+  `iv_offset` is 0, so the IV is the 512-byte sector index within the
+  mapping.
+- **Only the first 8 of 16 bytes carry data.** `crypt_iv_plain64_gen()`
+  zeroes the whole `iv_size`-byte buffer and writes only a
+  little-endian `u64`, so the upper 8 bytes of the XTS tweak are always
+  zero.
+
+**Citations.** Line numbers are in `drivers/md/dm-crypt.c` at the same
+pinned commit as the [key-lifecycle call
+graph](#key-lifecycle-call-graph),
+[`43fd83c0`](https://github.com/torvalds/linux/tree/43fd83c0b1dc127cf13b4c05303665924e63ef94/drivers/md/dm-crypt.c),
+rechecked on 2026-11-26. The default cipher mode is from cryptsetup's
+`configure.ac` at commit `bae21790` (the `plain-mode` and `luks1-mode`
+defaults are `xts-plain64`). The XTS tweak mechanism is IEEE Std
+1619-2007; its call chain inside Linux is the blue step in the
+[key-lifecycle call graph](#key-lifecycle-call-graph).
