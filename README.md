@@ -15,9 +15,10 @@ narrowly-scoped passphrase-recovery technique.**
    tools, and how to tell real corruption apart from LUKS2's normal,
    by-design quirks (like the primary and secondary headers legitimately
    differing from each other). See [`docs/`](docs/).
-2. **One recovery script** implementing a bounded edit-distance-1 search
-   for a passphrase you're highly confident about but suspect you
-   fat-fingered by exactly one character.
+2. **One recovery script** implementing a bounded edit-distance search
+   (one slip by default, two with `--edit-distance 2`) for a passphrase
+   you're highly confident about but suspect you fat-fingered by a
+   character or two.
 
 It is deliberately **not**:
 
@@ -115,7 +116,7 @@ and secondary headers legitimately differ — is in
   report for each kind of damage, what no inspection can detect, and a
   step-by-step decision guide.
 - [`docs/passphrase-recovery.md`](docs/passphrase-recovery.md) — the
-  edit-distance-1 search in detail, why it's safe, and which slips it
+  edit-distance search in detail, why it's safe, and which slips it
   does and does not recover.
 - [`docs/cold-boot-and-dma-attacks.md`](docs/cold-boot-and-dma-attacks.md) —
   a deliberately separate threat model: attacking the cleartext master
@@ -171,7 +172,8 @@ flipping one letter's case), each with
 `cryptsetup open --test-passphrase`, which never activates the device.
 An image file of the device needs no root. It does not cover every
 one-character difference: a missing letter is tried only with
-`--insert-letters`. See
+`--insert-letters`. `--edit-distance 2` combines two of those edits for
+a guess two slips away, at the cost of a much larger, slower search. See
 [`docs/passphrase-recovery.md`](docs/passphrase-recovery.md) for the
 full walkthrough and real example output.
 
@@ -196,9 +198,6 @@ in this repo:
   built from a memorable phrase or word list, generating candidates
   from likely word substitutions or common transformations (leetspeak,
   capitalization changes) rather than pure character-level edits.
-- **Edit-distance-2 search.** Covering two simultaneous slips, with
-  appropriate warnings about the combinatorial growth in candidate
-  count (and therefore Argon2id wall-clock cost) as distance increases.
 - **Integration with GPU-accelerated tools** like `hashcat`'s or
   `john`'s LUKS modes for cases that genuinely need larger search
   spaces than a CPU-bound `--test-passphrase` loop can cover in
@@ -215,9 +214,10 @@ in this repo:
 - **Scope a C or Rust rewrite of the tooling.** `scripts/recover-passphrase`
   and `scripts/inspect-keyslot` are POSIX `sh` today, which keeps them
   auditable and dependency-free but means candidate generation is
-  inherently slower than a compiled implementation, which matters as
-  search space grows (edit-distance-2, wider candidate sets, dictionary
-  search — all listed above). Scoping work would need to weigh: each
+  inherently slower than a compiled implementation, which matters as the
+  search space grows — `--edit-distance 2` already generates thousands
+  of candidates in `sh`, and the dictionary search on the roadmap would
+  push it further. Scoping work would need to weigh: each
   `cryptsetup open --test-passphrase` call spends about 2 seconds in
   Argon2id with default settings, which dominates the run time
   regardless of language; whether a rewrite
@@ -229,7 +229,7 @@ in this repo:
 
 If you build one of these, a PR is welcome — please keep new methods in
 their own clearly-labeled script/doc pair rather than folding them into
-the existing edit-distance-1 tool, so the safe/tractable case stays
+the existing edit-distance tool, so the safe/tractable case stays
 simple and the more speculative/expensive methods stay clearly opt-in.
 
 ### Research milestones (pre-roadmap)

@@ -1,4 +1,4 @@
-# Passphrase Recovery: Bounded Edit-Distance-1 Search
+# Passphrase Recovery: Bounded Edit-Distance Search
 
 This document explains the one recovery technique this project
 implements, `scripts/recover-passphrase`, what it searches, and its
@@ -120,6 +120,24 @@ and `a`), `Rango-ok7` (`R` for the uppercase neighbour `T`) and
 default is `Tango-o7`, a missing letter — and that one too is
 recovered when the search is run with `--insert-letters`.
 
+## Two edits at once
+
+By default the search covers one edit (edit distance 1). `--edit-distance
+2` combines two of the edits above, for a passphrase two slips from your
+guess rather than one. It applies every edit to every distance-1
+candidate, so the candidate count grows roughly as the square of the
+distance-1 count — tens of thousands for a typical passphrase, each still
+a full KDF run. The script prints the count and a rough time estimate
+before it starts and warns that the run can be long; narrow it with the
+`--no-*` options, or run it against a keyslot with a fast KDF (PBKDF2).
+In the experiment, `Rango-ol7` — two neighbour slips from `Tango-ok7`
+(`R` for the uppercase `T`, and `l` for `k`) — is not found at distance
+1 but is recovered at distance 2.
+
+Edit distances beyond 2 are not implemented: the candidate count, and so
+the running time, grows by roughly another few-hundred-fold at each
+step.
+
 ## Usage walkthrough
 
 ```
@@ -179,8 +197,8 @@ passphrase afterwards, as the script's own reminder says.
 
 `./scripts/recover-passphrase --help` lists the options: `--layout`,
 `--no-substitution`, `--no-deletion`, `--no-insertion`,
-`--no-transposition`, `--no-case-flip`, `--insert-chars` and
-`--insert-letters`.
+`--no-transposition`, `--no-case-flip`, `--insert-chars`,
+`--insert-letters` and `--edit-distance`.
 
 ## Keyboard layouts
 
@@ -219,6 +237,6 @@ wrong.
 
 ---
 
-For what is deliberately not built yet (larger edit distances,
+For what is deliberately not built yet (edit distances beyond 2,
 dictionary-based candidates, GPU search), see the
 [Roadmap section of the README](../README.md#roadmap).
