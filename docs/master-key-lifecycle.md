@@ -18,6 +18,7 @@ source pinned to a specific commit.
 - [How the kernel uses the key](#how-the-kernel-uses-the-key)
 - [Key-lifecycle call graph](#key-lifecycle-call-graph)
 - [Tweak/IV generation](#tweakiv-generation)
+- [Userspace unlock path](#userspace-unlock-path)
 
 ## What the master key is
 
@@ -208,8 +209,9 @@ The diagram traces the key from `luksOpen` through per-sector I/O to
 `luksClose`, each edge checked against kernel source at the pinned
 commits in the table below. It covers only the key's lifecycle;
 tweak/IV generation is traced in [Tweak/IV
-generation](#tweakiv-generation) below, and the userspace unlock path is
-left to a separate diagram.
+generation](#tweakiv-generation) below, and the userspace unlock path
+that leads up to `luksOpen` in [Userspace unlock
+path](#userspace-unlock-path).
 
 ```mermaid
 flowchart TD
@@ -488,3 +490,108 @@ rechecked on 2026-11-26. The default cipher mode is from cryptsetup's
 defaults are `xts-plain64`). The XTS tweak mechanism is IEEE Std
 1619-2007; its call chain inside Linux is the blue step in the
 [key-lifecycle call graph](#key-lifecycle-call-graph).
+
+## Userspace unlock path
+
+The two diagrams above live inside the kernel; they begin where
+device-mapper calls dm-crypt's `.ctr`/`.map`. This one covers what runs
+**before** that, in libcryptsetup, when you run `cryptsetup luksOpen`
+(or `open`): how the passphrase becomes a verified master key that is
+then handed to the kernel. It ends exactly where the other two begin.
+
+The path has two phases. **First, prove the passphrase is right** —
+derive a key from it, use that key to decrypt and reassemble the stored
+master key, and check the result against the master-key digest. That is
+the whole of what `cryptsetup open --test-passphrase` does (see
+[`passphrase-recovery.md`](passphrase-recovery.md)), and it is the step
+`scripts/recover-passphrase` repeats for each candidate. **Then, only if
+the digest matches, build the mapping** — hand the master key and the
+dm-crypt table to device-mapper, which creates the `/dev/mapper/<name>`
+device.
+
+```mermaid
+flowchart TD
+    subgraph U0["1. API entry (cryptsetup luksOpen)"]
+        E1["crypt_activate_by_passphrase()<br/>setup.c:5725"]
+        E2["crypt_activate_by_keyslot_context()<br/>setup.c:5511"]
+        E3["kc-&gt;get_luks2_volume_key(cd, kc, keyslot, &amp;vk)<br/>passphrase keyslot-context callback<br/>setup.c:5581"]
+        E1 -->|wrap passphrase in a keyslot context| E2 --> E3
+    end
+
+    subgraph K["2. Keyslot open and passphrase test"]
+        K1["LUKS2_keyslot_open()<br/>luks2_keyslot.c:572"]
+        K2["LUKS2_keyslot_open_priority()<br/>try keyslots by priority<br/>luks2_keyslot.c:423"]
+        K3["_open_and_verify()<br/>luks2_keyslot.c:348"]
+        K4["h-&gt;open(...) dispatch<br/>luks2_keyslot.c:367"]
+        K5["luks2_keyslot_open() [.open]<br/>luks2_keyslot_luks2.c:533 / 802"]
+        K6["luks2_keyslot_get_key()<br/>luks2_keyslot_luks2.c:259"]
+        K7["crypt_pbkdf(...)<br/>derive keyslot key from passphrase + salt<br/>(Argon2id / PBKDF2)<br/>luks2_keyslot_luks2.c:334"]
+        K8["luks2_decrypt_from_storage(...)<br/>decrypt the keyslot area with that key<br/>luks2_keyslot_luks2.c:354"]
+        K9["AF_merge(...)<br/>reassemble the candidate master key<br/>luks2_keyslot_luks2.c:360 -&gt; af.c:122"]
+        K10["LUKS2_digest_verify(cd, hdr, vk, keyslot)<br/>luks2_keyslot.c:379"]
+        K11["PBKDF2_digest_verify()<br/>recompute digest, compare to stored<br/>luks2_digest_pbkdf2.c:15"]
+
+        K1 --> K2 --> K3
+        K3 --> K4 --> K5 --> K6
+        K6 --> K7 --> K8 --> K9
+        K3 --> K10 --> K11
+    end
+
+    subgraph V["3. Activate — only after the digest matches"]
+        V1["_activate_by_volume_key()<br/>setup.c:5452"]
+        V2["_activate_luks2_by_volume_key()<br/>setup.c:5291"]
+        V3["LUKS2_activate()<br/>build the dm-crypt target (dmd)<br/>luks2_json_metadata.c:2684"]
+        V4["create_or_reload_device()<br/>setup.c:5097"]
+        V5["dm_create_device(cd, name, type, dmd)<br/>setup.c:5131"]
+        V1 --> V2 --> V3 --> V4 --> V5
+    end
+
+    subgraph X["4. Kernel (see the diagrams above)"]
+        X1["device-mapper ioctl<br/>(libdevmapper — not traced here)"]
+        X2["dm-crypt crypt_ctr() / crypt_map()<br/>key-lifecycle and tweak/IV diagrams"]
+        X1 --> X2
+    end
+
+    E3 --> K1
+    K11 -->|on digest match, vk is the master key| V1
+    V5 --> X1
+
+    classDef xref fill:#e7f1ff,stroke:#084298,color:#052c65
+    class X1,X2 xref
+```
+
+The blue nodes are the kernel side, traced by the [key-lifecycle call
+graph](#key-lifecycle-call-graph) and [Tweak/IV
+generation](#tweakiv-generation); they are shown here only to mark the
+hand-off.
+
+Points worth drawing out:
+
+- **The passphrase is never compared to a stored passphrase.** It is run
+  through a KDF, the derived key decrypts the keyslot, the result is
+  AF-merged into a candidate master key, and only that candidate is
+  checked — against a digest of the *master key*, not of the passphrase
+  (K10/K11). A wrong passphrase yields a wrong candidate, whose digest
+  will not match. That is why recovery is a search over candidate
+  passphrases rather than a lookup, and why each attempt costs a full
+  KDF run.
+- **Where `--test-passphrase` stops.** It runs the keyslot-open and
+  passphrase test (subgraph 2) and reports the result without reaching
+  the activation step (subgraph 3), so no device is created and nothing
+  is mapped — which is what makes it safe to run repeatedly (see
+  [`passphrase-recovery.md`](passphrase-recovery.md)).
+- **Keyslots are tried by priority.** `LUKS2_keyslot_open_priority`
+  tries higher-priority keyslots first, and a passphrase is tested
+  against each until one yields a candidate whose digest matches.
+
+**Citations.** Line numbers are in cryptsetup at commit `bae21790`,
+rechecked on 2026-11-26 against the local source copies, across
+`lib/setup.c`, `lib/luks2/luks2_keyslot.c`,
+`lib/luks2/luks2_keyslot_luks2.c`, `lib/luks2/luks2_json_metadata.c`,
+`lib/luks2/luks2_digest_pbkdf2.c` and `lib/luks1/af.c` (`AF_merge` is
+shared with LUKS1;
+[`af-splitting-explained.md`](af-splitting-explained.md) covers it in
+depth). The device-mapper ioctl layer (`lib/libdevmapper.c`) is not
+traced here; the kernel side it reaches is the [key-lifecycle call
+graph](#key-lifecycle-call-graph) and [Tweak/IV
+generation](#tweakiv-generation).
