@@ -1,0 +1,97 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Mohammadreza Khellat <mkhellat@beavernets.com>
+# Run the dictionary-recovery experiment.  See README.md.
+#
+# Formats throwaway LUKS2 image files whose passphrases are built from a
+# dictionary word by each of recover-dictionary's transformations, and
+# checks that the matching wordlist entry recovers them. Needs no root
+# and touches no block device. Everything is deleted on exit.
+set -eu
+
+here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+repo=$(CDPATH='' cd -- "$here/../.." && pwd)
+rd=$repo/scripts/recover-dictionary
+
+for tool in cryptsetup truncate sha256sum; do
+	command -v "$tool" >/dev/null 2>&1 || {
+		echo "error: $tool is required" >&2
+		exit 1
+	}
+done
+
+work=$(mktemp -d)
+trap 'rm -rf -- "$work"' EXIT INT TERM
+
+cryptsetup --version
+img=$work/fast.img
+
+# try PASSPHRASE WORDLIST-CONTENT LABEL [OPTIONS...]
+# Format a fresh fast image with PASSPHRASE, write WORDLIST-CONTENT to a
+# file, run recover-dictionary against it, and print the summary lines
+# with the temporary path masked.
+try() {
+	pass=$1
+	words=$2
+	label=$3
+	shift 3
+
+	truncate -s 32M "$img"
+	printf '%s' "$pass" > "$work/passphrase"
+	cryptsetup luksFormat --type luks2 --batch-mode \
+		--pbkdf pbkdf2 --pbkdf-force-iterations 1000 \
+		--key-file "$work/passphrase" "$img"
+	printf '%s' "$words" > "$work/wl"
+
+	echo
+	echo "== Passphrase '$pass' ($label) =="
+	before=$(sha256sum < "$img")
+	set +e
+	sh "$rd" --wordlist "$work/wl" "$@" "$img" > "$work/out" 2>&1
+	status=$?
+	set -e
+	sed -e "s|$work|<tmpdir>|g" "$work/out" |
+		grep -E 'wordlist:|generated|MATCH|working passphrase|no match found|error' |
+		grep -v -- '\.\.\. no match$' || true
+	echo "   exit status: $status"
+	if [ "$(sha256sum < "$img")" = "$before" ]; then
+		echo "   image unchanged by the search"
+	else
+		echo "   image CHANGED by the search"
+	fi
+	rm -f "$img"
+}
+
+# One case per transformation. --no-append keeps the leet and separator
+# searches small; the capitalization case needs the appended year.
+try 'Summer2024'    'summer'          'Capitalized word + appended year'
+try 'p@55w0rd'      'password'        'leetspeak' --no-append
+try 'correct-horse' 'correct horse'   "two words joined with '-'" --no-append
+try 'Summer2024'    'winter'          'word not in the list (no match)'
+
+# The default wordlist path is used when --wordlist is omitted; on a
+# machine without /usr/share/dict/words the script must say so rather
+# than guess.
+echo
+echo "== No --wordlist and no system dictionary =="
+truncate -s 32M "$img"
+printf '%s' 'whatever' > "$work/passphrase"
+cryptsetup luksFormat --type luks2 --batch-mode \
+	--pbkdf pbkdf2 --pbkdf-force-iterations 1000 \
+	--key-file "$work/passphrase" "$img"
+if [ -f /usr/share/dict/words ]; then
+	echo "   (skipped: /usr/share/dict/words exists on this machine)"
+else
+	set +e
+	sh "$rd" "$img" 2>&1 | sed -e "s|$work|<tmpdir>|g"
+	set -e
+fi
+rm -f "$img"
+
+echo
+echo "== A file that is not a LUKS device =="
+truncate -s 1M "$work/notluks.img"
+printf 'summer\n' > "$work/wl"
+set +e
+sh "$rd" --wordlist "$work/wl" "$work/notluks.img" 2>&1 | sed -e "s|$work|<tmpdir>|g"
+set -e

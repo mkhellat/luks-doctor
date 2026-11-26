@@ -34,6 +34,7 @@ on exit.
 | [`entropy-tests/`](entropy-tests) | What chi-squared, Shannon entropy, the SP 800-22 monobit test, `inspect-keyslot`'s heuristics and `cryptsetup repair` detect in a real keyslot area under different kinds of damage | `cryptsetup`, `python3`, Python `scipy` |
 | [`passphrase-recovery/`](passphrase-recovery) | Which one-slip guesses `scripts/recover-passphrase` recovers and which it cannot, its error handling, and the time per guess with default Argon2id | `cryptsetup`; up to 1 GiB RAM |
 | [`keyboard-adjacency/`](keyboard-adjacency) | That the script's keyboard-adjacency tables match a physical ANSI key grid (reproducing QWERTY and QWERTZ, deriving Dvorak), and that `--layout dvorak` recovers a Dvorak-only neighbour slip | `cryptsetup`, `python3` |
+| [`dictionary-recovery/`](dictionary-recovery) | That `scripts/recover-dictionary` recovers a passphrase built from a wordlist entry by each transformation (capitalization, leetspeak, appended year, word separators), plus its no-match and error paths | `cryptsetup` |
 
 ## Running
 
@@ -48,6 +49,7 @@ experiments/corruption-signals/run
 experiments/entropy-tests/run
 experiments/passphrase-recovery/run
 experiments/keyboard-adjacency/run
+experiments/dictionary-recovery/run
 ```
 
 The `run` scripts pass `shellcheck --shell=sh`. They were run under
